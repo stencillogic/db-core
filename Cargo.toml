@@ -3,6 +3,12 @@ name = "db-core"
 version = "0.1.0"
 authors = ["stencillogic"]
 edition = "2018"
+desctiption = "dbms engine"
+license = MIT
+categories = ["dbms"]
+keywords = ["dbms"]
+repository = "https://github.com/stencillogic/db-core"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
