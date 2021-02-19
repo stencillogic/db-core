@@ -1,4 +1,6 @@
-# DB-Core
+# DB-Core 
+
+Current status: WIP
 
 DB-Core is a transaction processing system with ACID guaranties for client application's data. 
 It can be used as a backend for a DBMS, or a no-sql database, or as a sort of embedded dbms.
