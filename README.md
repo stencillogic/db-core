@@ -1,5 +1,7 @@
 # DB-Core 
 
+![Rust](https://github.com/stencillogic/db-core/workflows/Rust/badge.svg)
+
 Current status: WIP
 
 DB-Core is a transaction processing system with ACID guaranties for client application's data. 
