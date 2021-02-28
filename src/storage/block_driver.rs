@@ -15,7 +15,7 @@ use crate::block_mgr::block_mgr::BlockMgr;
 use crate::block_mgr::block::BlockLocked;
 use crate::block_mgr::block::BlockLockedMut;
 use crate::block_mgr::block::DataBlock;
-use crate::block_mgr::block::DataBlockEntryMut;
+use crate::block_mgr::block::DataBlockEntry;
 use crate::block_mgr::block::BasicBlock;
 use crate::block_mgr::block::ENTRY_HEADER_LEN;
 use crate::block_mgr::block::VERENTRY_HEADER_LEN;
@@ -123,6 +123,7 @@ impl<'b> BlockStorageDriver {
     pub fn is_locked(&self, obj_id: &ObjectId) -> Result<Option<u64>, Error> {
         let block_id = BlockId::from_obj(obj_id);
         let block = self.block_mgr.get_block(&block_id)?;
+        Self::check_object_exists(&block, obj_id.entry_id)?;
         let entry = block.get_entry(obj_id.entry_id)?;
         Ok(Some(entry.get_tsn()))
     }
@@ -140,8 +141,8 @@ impl<'b> BlockStorageDriver {
 
         entry.set_tsn(tsn);
         entry.set_csn(csn);
-        entry.set_start();
-        entry.set_end();
+        entry.set_start(true);
+        entry.set_end(true);
 
         if block.get_used_space() >= self.block_mgr.block_fill_size() {
             self.block_allocator.set_free_info_used(&block.get_id())?;
@@ -157,7 +158,7 @@ impl<'b> BlockStorageDriver {
             block_id,
             entry_id,
             entry_pos: 0,
-            appending: true,
+            appending: initial_size == 0,
             tsn,
             csn,
         }))
@@ -179,14 +180,14 @@ impl<'b> BlockStorageDriver {
 
         let mut entry = block.get_entry_mut(next_entry_id)?;
 
-        Self::check_not_deleted(&entry)?;
+        Self::check_not_deleted(&entry.immut())?;
 
         loop {
             self.version_store.create_version(&next_block_id, &mut entry, tsn)?;
 
             entry.set_tsn(tsn);
-            entry.set_tsn(csn);
-            entry.set_deleted();
+            entry.set_csn(csn);
+            entry.set_deleted(true);
 
             if entry.is_end() {
                 break;
@@ -220,7 +221,7 @@ impl<'b> BlockStorageDriver {
         }
     }
 
-    fn check_not_deleted(entry: &DataBlockEntryMut) -> Result<(), Error> {
+    fn check_not_deleted(entry: &DataBlockEntry) -> Result<(), Error> {
         if entry.is_deleted() {
             Err(Error::object_is_deleted())
         } else {
@@ -237,7 +238,7 @@ impl<'b> BlockStorageDriver {
 
         let mut entry = block.get_entry_mut(obj_id.entry_id)?;
 
-        Self::check_not_deleted(&entry)?;
+        Self::check_not_deleted(&entry.immut())?;
 
         if entry.get_tsn() != tsn {
             self.version_store.create_version(&block_id, &mut entry, tsn)?;
@@ -262,14 +263,23 @@ impl<'b> BlockStorageDriver {
 
         Self::check_object_exists(&block, obj_id.entry_id)?;
 
-        Ok(Cursor {
+        let c = Cursor {
             block_id,
             entry_id: obj_id.entry_id,
             entry_pos: 0,
             appending: false,
             tsn,
             csn,
-        })
+        };
+
+        let (b, e, v) = self.find_entry_version(&c)?;
+        let block = b;
+        let entry_id = e;
+        let entry = if v {block.get_version_entry(entry_id)?.to_inner_entry()} else {block.get_entry(entry_id)?};
+
+        Self::check_not_deleted(&entry)?;
+
+        Ok(c)
     }
 
     /// Write data to object opened for write.
@@ -285,6 +295,7 @@ impl<'b> BlockStorageDriver {
             } else {
                 if entry.is_end() {
                     c.appending = true;
+                    drop(block);
                     return self.write_append(c, data);
                 } else {
                     let (block_id, entry_id) = entry.get_continuation();
@@ -336,7 +347,7 @@ impl<'b> BlockStorageDriver {
         let cur_block_id = cur_block.get_id();
         let free = cur_block.get_free_space();
 
-        if free > 0 {
+        if free > VERENTRY_HEADER_LEN {
             // try extending current entry
             let extend_sz = std::cmp::min(data.len(), free - VERENTRY_HEADER_LEN);
             let cbid = cur_block.get_id();
@@ -369,6 +380,7 @@ impl<'b> BlockStorageDriver {
                 self.version_store.create_version(&cur_block_id, &mut prev_entry, c.tsn)?;
                 prev_entry.set_tsn(c.tsn);
             }
+            prev_entry.set_end(false);
 
             let entry_sz = std::cmp::min(new_block.get_free_space() - VERENTRY_HEADER_LEN, data.len() + ENTRY_HEADER_LEN);
             let mut entry = new_block.add_entry(entry_sz);
@@ -377,7 +389,7 @@ impl<'b> BlockStorageDriver {
 
             entry.set_tsn(c.tsn);
             entry.set_csn(c.csn);
-            entry.set_end();
+            entry.set_end(true);
 
             prev_entry.set_continuation(&new_block_id, entry.get_id());
 
@@ -385,13 +397,13 @@ impl<'b> BlockStorageDriver {
             c.entry_id = entry.get_id();
             c.entry_pos = entry.data_size();
 
-            entry.mut_slice(0, c.entry_pos).copy_from_slice(&data[..entry_sz]);
+            entry.mut_slice(0, c.entry_pos).copy_from_slice(&data[..c.entry_pos as usize]);
 
             if new_block.get_used_space() >= self.block_mgr.block_fill_size() {
                 self.block_allocator.set_free_info_used(&new_block.get_id())?;
             }
 
-            Ok((entry_sz, checkpoint_csn))
+            Ok((c.entry_pos as usize, checkpoint_csn))
         }
     }
 
@@ -399,74 +411,81 @@ impl<'b> BlockStorageDriver {
     /// are not allowed we should not see changes made by other transactions, and thus must look up
     /// in the version store for the latest commited changes (not later than certain csn).
     /// Or if the entry was changed by the current transaction then we can return those changes.
-    fn find_entry_version(&self, c: &mut Cursor) -> Result<(BlockLocked<DataBlock>, u16), Error> {
+    fn find_entry_version(&self, c: &Cursor) -> Result<(BlockLocked<DataBlock>, u16, bool), Error> {
         let (b, e) = (c.block_id, c.entry_id);
         let mut block_id = b;
         let mut entry_id = e;
 
+        let block = self.block_mgr.get_block(&block_id)?;
+        let entry = block.get_entry(entry_id)?;
+
+        if entry.get_csn() <= c.csn || entry.get_tsn() == c.tsn {
+            return Ok((block, entry_id, false));
+        }
+
         loop {
-            let block = self.block_mgr.get_block(&block_id)?;
-            let entry = block.get_entry(entry_id)?;
-
-            if entry.get_csn() <= c.csn || entry.get_tsn() == c.tsn {
-                return Ok((block, entry_id));
-            }
-
             let (b, e) = entry.get_prev_version_ptr();
             block_id = b;
             entry_id = e;
+
+            let block = self.block_mgr.get_block(&block_id)?;
+            let ver_entry = block.get_version_entry(entry_id)?;
+            let entry = ver_entry.inner_entry();
+
+            if entry.get_csn() <= c.csn || entry.get_tsn() == c.tsn {
+                return Ok((block, entry_id, true));
+            }
         }
     }
 
-
     /// Read data from an object opened for read.
     pub fn read(&self, c: &mut Cursor, buf: &mut [u8]) -> Result<usize, Error> {
-        let buf_len = buf.len();
-        let remaining = buf;
-        let (b, e) = self.find_entry_version(c)?;
+        let mut remaining = buf.len();
+        let (b, e, v) = self.find_entry_version(c)?;
         let mut block = b;
         let mut entry_id = e;
-        let mut entry = block.get_entry(entry_id)?;
+        let mut entry = if v {block.get_version_entry(entry_id)?.to_inner_entry()} else {block.get_entry(entry_id)?};
 
-        while remaining.len() > 0 {
+        while remaining > 0 {
 
-            let l = std::cmp::min(remaining.len(), (entry.data_size() - c.entry_pos) as usize) as u16;
-
-            let (dst, remaining) = remaining.split_at_mut(l as usize);
+            let l = std::cmp::min(remaining, (entry.data_size() - c.entry_pos) as usize) as u16;
+            let buf_pos = buf.len() - remaining;
+            let dst = &mut buf[buf_pos..buf_pos + l as usize];
             let src = entry.slice(c.entry_pos, c.entry_pos + l);
             dst.copy_from_slice(src);
             c.entry_pos += l;
+            remaining -= l as usize;
 
             if c.entry_pos == entry.data_size() {
 
                 if entry.is_end() {
                     c.appending = true;
-                    return Ok(buf_len - remaining.len());
+                    return Ok(buf.len() - remaining);
                 }
 
                 let (block_id, eid) = entry.get_continuation();
                 c.block_id = block_id;
                 c.entry_id = eid;
                 c.entry_pos = 0;
-                if remaining.len() > 0 {
-                    let (b, e) = self.find_entry_version(c)?;
+                if remaining > 0 {
+                    let (b, e, v) = self.find_entry_version(c)?;
                     block = b;
                     entry_id = e;
-                    entry = block.get_entry(entry_id)?;
+                    entry = if v {block.get_version_entry(entry_id)?.to_inner_entry()} else {block.get_entry(entry_id)?};
                 }
             }
         }
 
-        Ok(buf_len)
+        Ok(buf.len())
     }
 
     /// Seek inside object from current position forward.
     pub fn seek(&self, c: &mut Cursor, pos: u64) -> Result<u64, Error> {
         let mut remaining = pos;
-        let (b, e) = self.find_entry_version(c)?;
+        let (b, e, v) = self.find_entry_version(c)?;
         let mut block = b;
         let mut entry_id = e;
-        let mut entry = block.get_entry(entry_id)?;
+        let mut entry = if v {block.get_version_entry(entry_id)?.to_inner_entry()} else {block.get_entry(entry_id)?};
 
         while remaining > 0 {
 
@@ -486,10 +505,10 @@ impl<'b> BlockStorageDriver {
                 c.entry_id = eid;
                 c.entry_pos = 0;
                 if remaining > 0 {
-                    let (b, e) = self.find_entry_version(c)?;
+                    let (b, e, v) = self.find_entry_version(c)?;
                     block = b;
                     entry_id = e;
-                    entry = block.get_entry(entry_id)?;
+                    entry = if v {block.get_version_entry(entry_id)?.to_inner_entry()} else {block.get_entry(entry_id)?};
                 }
             }
         }
@@ -504,7 +523,6 @@ impl<'b> BlockStorageDriver {
         let mut trn_entry_iter = self.version_store.get_iter_for_tran(tsn)?;
 
         while let Some((tgt_block_id, _tgt_entry_id, mut ver_block, ver_entry_id)) = trn_entry_iter.get_next()? {
-
             let mut ver_entry = ver_block.get_version_entry_mut(ver_entry_id)?;
             let (mut block, _) = self.get_block_mut(&tgt_block_id)?;
             block.restore_entry(&ver_entry.inner_entry())?;
@@ -512,6 +530,7 @@ impl<'b> BlockStorageDriver {
 
         Ok(())
     }
+
 
     /// Go through checkpoint store blocks and restore all the blocks in the main data store to the
     /// state as of before the first modification has been made under the last completed checkpoint.
@@ -553,14 +572,15 @@ impl<'b> BlockStorageDriver {
     /// 5. If requested_size is larger than the block size then don't search for free block, rather
     ///    allocate a new one at once.
     fn get_free_mut(&self, requested_size: usize) -> Result<(BlockLockedMut<DataBlock>, u64), Error> {
-        let ret = if requested_size > self.block_mgr.block_fill_size() {
-            (self.block_allocator.allocate_block()?, self.csns.checkpoint_csn.get_cur())
+        let mut block = if requested_size > self.block_mgr.block_fill_size() {
+            self.block_allocator.allocate_block()?
         } else {
-            let mut block = self.block_allocator.get_free()?;
-            let checkpoint_csn = self.process_checkpoint(&mut block)?;
-            (block, checkpoint_csn)
+            self.block_allocator.get_free()?
         };
-        Ok(ret)
+
+        let checkpoint_csn = self.process_checkpoint(&mut block)?;
+
+        Ok((block, checkpoint_csn))
     }
 
     /// When we want to modify a data block we need to do some actions related to checkpointing:
@@ -574,10 +594,16 @@ impl<'b> BlockStorageDriver {
     fn process_checkpoint(&self, block: &mut BlockLockedMut<DataBlock>) -> Result<u64, Error> {
         let checkpoint_csn = self.csns.checkpoint_csn.get_cur();
 
-        self.write_data_block(block, checkpoint_csn)?;
+        if block.get_checkpoint_csn() == 0 {
+            block.set_checkpoint_csn(checkpoint_csn);
+        } else {
+            if block.get_checkpoint_csn() < checkpoint_csn {
+                self.buf_writer.write_data_block(block, &self.block_mgr, true)?;
 
-        self.checkpoint_store.add_block(&block, checkpoint_csn)?;
-        block.set_checkpoint_csn(checkpoint_csn);
+                block.set_checkpoint_csn(checkpoint_csn);
+                self.checkpoint_store.add_block(&block, checkpoint_csn)?;
+            }
+        }
 
         Ok(checkpoint_csn)
     }
@@ -598,28 +624,10 @@ impl<'b> BlockStorageDriver {
         while let Some(desc) = iter.next() {
             if desc.dirty && desc.block_type == BlockType::DataBlock {
                 let mut block = self.block_mgr.get_block_by_idx(desc.id).unwrap();
-                self.write_data_block(&mut block, checkpoint_csn)?;
-            }
-        }
 
-        Ok(())
-    }
-
-    /// check if block dirty and write it. If block has not written checkpoint copy the checkpoint
-    /// copy must be written to disk first.
-    fn write_data_block(&self, mut block: &mut BlockLockedMut<DataBlock>, checkpoint_csn: u64) -> Result<(), Error>  {
-
-        let desc = self.block_mgr.get_block_desc(block.get_buf_idx()).unwrap();
-
-        if desc.dirty && desc.block_type == BlockType::DataBlock {
-            if block.get_checkpoint_csn() < checkpoint_csn {
-                if !desc.checkpoint_written {
-                    let mut checkpoint_block = self.block_mgr.get_block_mut(&desc.checkpoint_block_id)?;
-                    self.block_mgr.write_block(&mut checkpoint_block)?;
-                    self.block_mgr.set_checkpoint_written(desc.id, true);
+                if block.get_checkpoint_csn() < checkpoint_csn {
+                    self.buf_writer.write_data_block(&mut block, &self.block_mgr, false)?;
                 }
-                self.block_mgr.write_block(&mut block)?;
-                self.block_mgr.set_dirty(desc.id, false);
             }
         }
 
@@ -707,6 +715,24 @@ mod tests {
         fdset
     }
 
+    fn write_full_slice(bd: &BlockStorageDriver, cursor: &mut Cursor, data: &[u8]) {
+        let mut written = 0;
+        while written < data.len() {
+            let (w, _checkpoint_csn) = bd.write(cursor, &data[written..]).expect("Failed to write to a block");
+            written += w;
+        }
+    }
+
+    fn read_full_slice(bd: &BlockStorageDriver, cursor: &mut Cursor, read_buf: &mut [u8]) {
+        let mut read = 0;
+        let len = read_buf.len();
+        while read < len {
+            let r = bd.read(cursor, &mut read_buf[read..len]).expect("Failed to read");
+            if r == 0 {break;}
+            read += r;
+        }
+    }
+
     #[test]
     fn test_block_driver() {
         let dspath = "/tmp/test_block_driver_5645379";
@@ -742,26 +768,162 @@ mod tests {
         let obj = ObjectId::init(3,1,1,0);
         assert!(bd.is_locked(&obj).is_err());
 
+
+        // Create an object and write to it, and then read
+
         let tsn = 123;
         let csn = csns.csn.get_next();
         let initial_size = 100;
         let (obj, mut cursor) = bd.create(tsn, csn, initial_size).expect("Failed to create object");
+        let mut total = 3;
         let (written, checkpoint_csn) = bd.write(&mut cursor, b"123").expect("Failed to write to a block");
-        for _ in 0..1000 {
-            let (written, checkpoint_csn) = bd.write(&mut cursor, b"1234567890").expect("Failed to write to a block");
+        assert_eq!(written, total);
+        let data = b"12345678901234567890";
+        for i in 0..1000 {
+            write_full_slice(&bd, &mut cursor, data);
+            total += data.len();
+        }
+        assert_eq!(total, 3 + 20*1000);
+
+        let csn = csns.csn.get_next();
+        let mut cursor = bd.begin_write(&obj, tsn, csn).expect("Failed to begin write");
+        let pos = 999*20 + 3;
+        let ret_pos = bd.seek(&mut cursor, pos).expect("Failed to seek to position");
+        assert_eq!(ret_pos, pos);
+
+        let data2 = b"asdfghjkl;";
+        for _ in 0..100 {
+            write_full_slice(&bd, &mut cursor, data2);
         }
 
-/*        bd.delete(&self, obj_id: &ObjectId, tsn: u64, csn: u64) -> Result<u64, Error>  {
-        bd.begin_write(&self, obj_id: &ObjectId, tsn: u64, csn: u64) -> Result<Cursor, Error> {
-        bd.begin_read(&self, obj_id: &ObjectId, tsn: u64, csn: u64) -> Result<Cursor, Error> {
-        bd.read(&self, c: &mut Cursor, buf: &mut [u8]) -> Result<usize, Error> {
-        bd.seek(&self, c: &mut Cursor, pos: u64) -> Result<u64, Error> {
-        bd.rollback_transaction(&self, tsn: u64) -> Result<(), Error> {
-        bd.restore_checkpoint(&self, checkpoint_csn: u64) -> Result<(), Error> {
-        bd.checkpoint(&self, checkpoint_csn: u64) -> Result<(), Error> {
-        bd.finish_tran(&self, tsn: u64) {
-        bd.add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
-*/
+        let read_buf = &mut [0;20];
+        let mut cursor = bd.begin_read(&obj, tsn, csn).expect("Failed to start reading");
+        read_full_slice(&bd, &mut cursor, &mut read_buf[0..3]);
+        assert_eq!(&read_buf[0..3], b"123");
+
+        for i in 0..999 {
+            let read_buf = &mut [0;20];
+            read_full_slice(&bd, &mut cursor, read_buf);
+            assert_eq!(&read_buf[0..data.len()], data);
+        }
+
+        for i in 0..100 {
+            let read_buf = &mut [0;10];
+            read_full_slice(&bd, &mut cursor, read_buf);
+            assert_eq!(read_buf, data2);
+        }
+
+        let read_buf = &mut [0;10];
+        let r = bd.read(&mut cursor, read_buf).expect("Failed to read");
+        assert_eq!(0, r);
+
+        bd.finish_tran(tsn);
+        let last_committed_csn = csn;
+
+
+        // Check isolation
+
+        let tsn = 124;
+        let csn = csns.csn.get_next();
+        let mut cursor = bd.begin_write(&obj, tsn, csn).expect("Failed to begin write");
+        let data3 = b"-=-=-=++++++";
+        write_full_slice(&bd, &mut cursor, data3);
+        let seek_pos = 999*20 + 3 - data3.len() as u64;
+        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        assert_eq!(ret_pos, seek_pos);
+        write_full_slice(&bd, &mut cursor, data3);
+
+        let tsn2 = 125;
+        let mut cursor = bd.begin_read(&obj, tsn2, last_committed_csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"123");
+        let seek_pos = 999*20;
+        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        assert_eq!(ret_pos, seek_pos);
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"asd");
+
+        let mut cursor = bd.begin_read(&obj, tsn2, csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"-=-");
+        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        assert_eq!(ret_pos, seek_pos);
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"-=-");
+
+
+        // Rollback and see both transactions see the same previous value.
+
+        bd.rollback_transaction(tsn).expect("Failed to rollback changes");
+
+        let mut cursor = bd.begin_read(&obj, tsn, csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"123");
+        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        assert_eq!(ret_pos, seek_pos);
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"asd");
+
+        let mut cursor = bd.begin_read(&obj, tsn2, last_committed_csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"123");
+        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        assert_eq!(ret_pos, seek_pos);
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"asd");
+
+
+        // Increase checkpoint_csn and test addition to checkpoint store.
+
+        let checkpoint_csn = csns.checkpoint_csn.get_next();
+        let tsn = 126;
+        let csn = csns.csn.get_next();
+        let mut cursor = bd.begin_write(&obj, tsn, csn).expect("Failed to begin write");
+        let data4 = b"123";
+        write_full_slice(&bd, &mut cursor, data4);
+        let seek_pos = 999*20;
+        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        assert_eq!(ret_pos, seek_pos);
+        write_full_slice(&bd, &mut cursor, data4);
+
+        bd.finish_tran(tsn);
+        let last_committed_csn = csn;
+
+
+        // Delete object.
+
+        let tsn3 = 127;
+        let csn = csns.csn.get_next();
+        let _checkpoint_csn = bd.delete(&obj, tsn3, csn).expect("Failed to delete an object");
+
+        let mut cursor = bd.begin_read(&obj, tsn2, last_committed_csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"123");
+
+        bd.finish_tran(tsn3);
+        let last_committed_csn = csn;
+
+        assert!(bd.begin_read(&obj, tsn2, last_committed_csn).is_err());
+
+
+        // Perform checkpoint, then restore from it and see the deleted object is back.
+
+        let checkpoint_csn = csns.checkpoint_csn.get_next();
+        bd.checkpoint(checkpoint_csn).expect("Checkpoint executed successfully");
+
+        bd.restore_checkpoint(checkpoint_csn-1).expect("Checkpoint restored successfully");
+
+        let mut cursor = bd.begin_read(&obj, tsn2, last_committed_csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        read_full_slice(&bd, &mut cursor, read_buf);
+
+        assert_eq!(read_buf, b"123");
+
         bd.terminate();
     }
 }

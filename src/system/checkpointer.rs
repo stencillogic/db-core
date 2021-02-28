@@ -151,7 +151,7 @@ impl Checkpointer {
                                 if let Err(e) = sd.checkpoint(checkpoint_csn) {
                                     error!("Failed to perform checkpoint: {}", e);
                                 } else {
-                                    if let Err(e) = log_mgr.write_checkpoint_completed(checkpoint_csn, csns.latest_commit_csn.load(Ordering::Relaxed)) {
+                                    if let Err(e) = log_mgr.write_checkpoint_completed(checkpoint_csn-1, csns.latest_commit_csn.load(Ordering::Relaxed)) {
                                         error!("Failed to write to log about checkpoint completion, error: {}", e);
                                     } else {
                                         info!("Checkpoint completed successfully");

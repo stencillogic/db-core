@@ -154,27 +154,32 @@ impl FreeInfo {
         };
         drop(block);
 
-        let prev_full_cnt;
+        let mut prev_full_cnt = 0;
+        let mut prev_changed = false;
         if fi_block_id > 0 {
             let mut block = self.block_mgr.get_free_info_block_mut(&bid)?;
-            self.set_fi_slice_bit(block.deref_mut(), block_id.block_id, header_fi_size, set);
+            let prev = self.set_fi_slice_bit(block.deref_mut(), block_id.block_id, header_fi_size, set);
             drop(block);
 
-            let mut block = self.block_mgr.get_extent_header_block_mut(&bid)?;
-            prev_full_cnt = block.get_full_cnt();
-            block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
-            drop(block);
+            if set != prev {
+                let mut block = self.block_mgr.get_extent_header_block_mut(&bid)?;
+                prev_full_cnt = block.get_full_cnt();
+                block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
+                prev_changed = true;
+                drop(block);
+            }
         } else {
             let mut block = self.block_mgr.get_extent_header_block_mut(&bid)?;
-            self.set_fi_slice_bit(block.deref_mut(), block_id.block_id, header_fi_size, set);
-
-            prev_full_cnt = block.get_full_cnt();
-            block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
+            if set != self.set_fi_slice_bit(block.deref_mut(), block_id.block_id, header_fi_size, set) {
+                prev_full_cnt = block.get_full_cnt();
+                block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
+                prev_changed = true;
+            }
             drop(block);
         };
 
-        if (!set && prev_full_cnt == fi_size) 
-            || (set && prev_full_cnt == fi_size - 1) 
+        if prev_changed && ((!set && prev_full_cnt == fi_size) 
+            || (set && prev_full_cnt == fi_size - 1))
         {
             // lock chained
             let file_lock_id = block_id.file_id as usize % self.file_locks.len();
@@ -229,14 +234,16 @@ impl FreeInfo {
         (byte_pos as usize, BYTE_BITS[id as usize % 8])
     }
 
-    fn set_fi_slice_bit<T: FreeInfoSection>(&self, block: &mut T, extent_id: u16, header_fi_size: u16, set: bool) {
+    fn set_fi_slice_bit<T: FreeInfoSection>(&self, block: &mut T, extent_id: u16, header_fi_size: u16, set: bool) -> bool {
         let fi_slice = block.fi_slice_mut();
         let (byte_pos, bit) = self.calc_bit_for_id(extent_id, header_fi_size);
+        let ret = 0 != (fi_slice[byte_pos] & bit);
         if set {
             fi_slice[byte_pos] |= bit;
         } else {
             fi_slice[byte_pos] &= !bit;
-        }
+        };
+        ret
     }
 
     // set a certain bit assuming extent level lock is acquired.
@@ -265,19 +272,21 @@ impl FreeInfo {
         let prev_full_cnt;
         if fi_block_id > 0 {
             let mut block = self.block_mgr.get_free_info_block_mut(&bid)?;
-            self.set_fi_slice_bit(block.deref_mut(), extent_id, header_fi_size, set);
+            let prev_set = self.set_fi_slice_bit(block.deref_mut(), extent_id, header_fi_size, set);
             drop(block);
 
-            let mut block = self.block_mgr.get_file_header_block_mut(&bid)?;
-            prev_full_cnt = block.get_full_cnt();
-            block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
-            drop(block);
+            if prev_set != set {
+                let mut block = self.block_mgr.get_file_header_block_mut(&bid)?;
+                prev_full_cnt = block.get_full_cnt();
+                block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
+                drop(block);
+            }
         } else {
             let mut block = self.block_mgr.get_file_header_block_mut(&bid)?;
-            self.set_fi_slice_bit(block.deref_mut(), extent_id, header_fi_size, set);
-
-            prev_full_cnt = block.get_full_cnt();
-            block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
+            if set != self.set_fi_slice_bit(block.deref_mut(), extent_id, header_fi_size, set) {
+                prev_full_cnt = block.get_full_cnt();
+                block.set_full_cnt(if set {prev_full_cnt + 1} else {prev_full_cnt - 1});
+            }
             drop(block);
         };
 

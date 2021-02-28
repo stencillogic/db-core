@@ -147,10 +147,10 @@ impl<'a> DataBlock<'a> {
             let slice = &self.data[start_offset..end_offset];
             let slice_mut = unsafe { std::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, slice.len()) };
 
-            Ok(DataBlockEntry(DataBlockEntryMut {
-                id: entry_id,
+            Ok(DataBlockEntry {
+                _id: entry_id,
                 data: slice_mut,
-            }))
+            })
         } else {
             Err(Error::object_does_not_exist())
         }
@@ -224,13 +224,13 @@ impl<'a> DataBlock<'a> {
         self.nent = src.nent;
     }
 
-    pub fn get_version_entry(&mut self, entry_id: u16) -> Result<DataBlockEntryVer, Error> {
+    pub fn get_version_entry(&self, entry_id: u16) -> Result<DataBlockEntryVer, Error> {
         if self.has_entry(entry_id) {
             let (start_offset, end_offset) = self.get_data_offsets(entry_id);
-            Ok(DataBlockEntryVer(DataBlockEntryVerMut {
+            Ok(DataBlockEntryVer {
                 id: entry_id,
-                data: &mut self.data[start_offset..end_offset],
-            }))
+                data: &self.data[start_offset..end_offset],
+            })
         } else {
             Err(Error::object_does_not_exist())
         }
@@ -311,7 +311,22 @@ impl<'a> DataBlock<'a> {
     fn shift_entries_above(&mut self, entry_id: u16, shift: i32) {
         // define region borders
         let i = DBLOCK_HEADER_LEN + 2*entry_id as usize;
-        let region_end = u16::slice_to_int(&self.data[i..i+2]).unwrap() as usize;
+        let region_end = {
+            // walk through entries in reverse order and find position of the first
+            // non-deleted entry, or return block size as region end
+            let mut pos = i;
+            loop {
+                if pos == DBLOCK_HEADER_LEN {
+                    break self.data.len();
+                }
+                let esp = u16::slice_to_int(&self.data[pos-2..pos]).unwrap() as usize;
+                if esp != 0 {
+                    break esp;
+                }
+                pos -= 2;
+            }
+        } - std::cmp::max(0, shift) as usize;
+
         let region_start = self.get_upper_bound();
 
         // update entry positions
@@ -438,43 +453,50 @@ impl Drop for DataBlock<'_> {
 
 
 /// Mutable data block entry.
-pub struct DataBlockEntry<'a>(DataBlockEntryMut<'a>);
+pub struct DataBlockEntry<'a> {
+    _id:     u16,
+    data:   &'a [u8],
+}
 
 
 impl<'a> DataBlockEntry<'a> {
 
     pub fn is_start(&self) -> bool {
-        self.0.is_start()
+        (self.data[0] & 0x01) != 0
     }
 
     pub fn is_end(&self) -> bool {
-        self.0.is_end()
+        (self.data[0] & 0x02) != 0
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        (self.data[0] & 0x04) != 0
     }
 
     // size of entry data
     pub fn data_size(&self) -> u16 {
-        self.0.data_size()
+        (self.data.len() - ENTRY_HEADER_LEN) as u16
     }
 
     pub fn get_tsn(&self) -> u64 {
-        self.0.get_tsn()
+        u64::slice_to_int(&self.data[1..9]).unwrap()
     }
 
     pub fn get_csn(&self) -> u64 {
-        self.0.get_csn()
+        u64::slice_to_int(&self.data[9..17]).unwrap()
     }
 
     pub fn get_prev_version_ptr(&self) -> (BlockId, u16) {
-        self.0.get_prev_version_ptr()
+        CommonOps::parse_obj_id(&self.data, 17)
     }
 
     pub fn get_continuation(&self) -> (BlockId, u16) {
-        self.0.get_continuation()
+        CommonOps::parse_obj_id(&self.data, 25)
     }
 
     // return slice chunk with data in given bounds
     pub fn slice(&self, start_pos: u16, end_pos: u16) -> &[u8] {
-        self.0.slice(start_pos, end_pos)
+        &self.data[ENTRY_HEADER_LEN + start_pos as usize .. ENTRY_HEADER_LEN + end_pos as usize]
     }
 
 }
@@ -487,16 +509,16 @@ pub struct DataBlockEntryMut<'a> {
 
 impl<'a> DataBlockEntryMut<'a> {
 
-    pub fn set_start(&mut self) {
-        self.data[0] |= 0x01;
+    pub fn set_start(&mut self, set: bool) {
+        if set {self.data[0] |= 0x01;} else {self.data[0] &= !0x01;}
     }
 
-    pub fn set_end(&mut self) {
-        self.data[0] |= 0x02;
+    pub fn set_end(&mut self, set: bool) {
+        if set {self.data[0] |= 0x02;} else {self.data[0] &= !0x02;}
     }
 
-    pub fn set_deleted(&mut self) {
-        self.data[0] |= 0x04;
+    pub fn set_deleted(&mut self, set: bool) {
+        if set {self.data[0] |= 0x04;} else {self.data[0] &= !0x04;}
     }
 
     pub fn set_tsn(&mut self, tsn: u64) {
@@ -526,16 +548,8 @@ impl<'a> DataBlockEntryMut<'a> {
         self.id
     }
 
-    pub fn is_start(&self) -> bool {
-        (self.data[0] & 0x01) != 0
-    }
-
     pub fn is_end(&self) -> bool {
         (self.data[0] & 0x02) != 0
-    }
-
-    pub fn is_deleted(&self) -> bool {
-        (self.data[0] & 0x04) != 0
     }
 
     // full size of the entry
@@ -552,21 +566,15 @@ impl<'a> DataBlockEntryMut<'a> {
         u64::slice_to_int(&self.data[1..9]).unwrap()
     }
 
-    pub fn get_csn(&self) -> u64 {
-        u64::slice_to_int(&self.data[9..17]).unwrap()
-    }
-
-    pub fn get_prev_version_ptr(&self) -> (BlockId, u16) {
-        CommonOps::parse_obj_id(&self.data, 17)
-    }
-
     pub fn get_continuation(&self) -> (BlockId, u16) {
         CommonOps::parse_obj_id(&self.data, 25)
     }
 
-    // return slice chunk with data in given bounds
-    pub fn slice(&self, start_pos: u16, end_pos: u16) -> &[u8] {
-        &self.data[ENTRY_HEADER_LEN + start_pos as usize .. ENTRY_HEADER_LEN + end_pos as usize]
+    pub fn immut(&self) -> DataBlockEntry {
+        DataBlockEntry {
+            _id:     self.id,
+            data:   self.data,
+        }
     }
 }
 
@@ -584,14 +592,6 @@ impl<'a> DataBlockEntryVerMut<'a> {
 
     pub fn get_id(&self) -> u16 {
         self.id
-    }
-
-    pub fn get_main_storage_ptr(&self) -> (BlockId, u16) {
-        CommonOps::parse_obj_id(&self.data, 0)
-    }
-
-    pub fn get_prev_created_entry_ptr(&self) -> (BlockId, u16) {
-        CommonOps::parse_obj_id(&self.data, 8)
     }
 
     pub fn inner_entry(&'a mut self) -> DataBlockEntryMut<'a> {
@@ -618,21 +618,42 @@ impl<'a> DataBlockEntryVerMut<'a> {
 
 
 /// Mutable data block entry in version store.
-pub struct DataBlockEntryVer<'a> (DataBlockEntryVerMut<'a>);
+pub struct DataBlockEntryVer<'a> {
+    id:     u16,
+    data:   &'a [u8],
+}
 
 
 impl<'a> DataBlockEntryVer<'a> {
 
     pub fn get_id(&self) -> u16 {
-        self.0.get_id()
+        self.id
     }
 
     pub fn get_main_storage_ptr(&self) -> (BlockId, u16) {
-        self.0.get_main_storage_ptr()
+        CommonOps::parse_obj_id(&self.data, 0)
     }
 
     pub fn get_prev_created_entry_ptr(&self) -> (BlockId, u16) {
-        self.0.get_prev_created_entry_ptr()
+        CommonOps::parse_obj_id(&self.data, 8)
+    }
+
+    pub fn inner_entry(&'a self) -> DataBlockEntry<'a> {
+        let id = u16::slice_to_int(&self.data[6..8]).unwrap();
+        let data = &self.data[VERENTRY_HEADER_LEN..];
+        DataBlockEntry {
+            _id: id,
+            data,
+        }
+    }
+
+    pub fn to_inner_entry(self) -> DataBlockEntry<'a> {
+        let id = u16::slice_to_int(&self.data[6..8]).unwrap();
+        let data = &self.data[VERENTRY_HEADER_LEN..];
+        DataBlockEntry {
+            _id: id,
+            data,
+        }
     }
 }
 
@@ -1164,13 +1185,13 @@ mod tests {
         let mut cont_entry_id = 0;
         let mut tsn = 0;
         let mut csn = 0;
-        assert_eq!(entry.get_prev_version_ptr(), (prev_block_id, prev_entry_id));
+        assert_eq!(entry.immut().get_prev_version_ptr(), (prev_block_id, prev_entry_id));
         assert_eq!(entry.get_continuation(), (cont_block_id, cont_entry_id));
-        assert!(!entry.is_start());
+        assert!(!entry.immut().is_start());
         assert!(!entry.is_end());
-        assert!(!entry.is_deleted());
+        assert!(!entry.immut().is_deleted());
         assert_eq!(entry.get_tsn(), tsn);
-        assert_eq!(entry.get_csn(), csn);
+        assert_eq!(entry.immut().get_csn(), csn);
 
         prev_block_id.file_id = 345;
         prev_block_id.extent_id = 45;
@@ -1182,28 +1203,28 @@ mod tests {
         cont_entry_id = 123;
         tsn = 7823423982067;
         csn = 67841123423545;
-        entry.set_start();
-        entry.set_end();
-        entry.set_deleted();
+        entry.set_start(true);
+        entry.set_end(true);
+        entry.set_deleted(true);
         entry.set_tsn(tsn);
         entry.set_csn(csn);
         entry.set_prev_version_ptr(&prev_block_id, prev_entry_id);
 
-        assert!(entry.is_deleted());
+        assert!(entry.immut().is_deleted());
 
         entry.set_continuation(&cont_block_id, cont_entry_id);
 
-        assert_eq!(entry.get_prev_version_ptr(), (prev_block_id, prev_entry_id));
+        assert_eq!(entry.immut().get_prev_version_ptr(), (prev_block_id, prev_entry_id));
         assert_eq!(entry.get_continuation(), (cont_block_id, cont_entry_id));
-        assert!(entry.is_start());
+        assert!(entry.immut().is_start());
         assert!(entry.is_end());
-        assert!(!entry.is_deleted());
+        assert!(!entry.immut().is_deleted());
         assert_eq!(entry.get_tsn(), tsn);
-        assert_eq!(entry.get_csn(), csn);
+        assert_eq!(entry.immut().get_csn(), csn);
 
         assert_eq!(entry.size() as usize, entry_sz + extend_size);
         assert_eq!(entry.data_size() as usize, entry_sz + extend_size - ENTRY_HEADER_LEN);
-        assert_eq!(entry.slice(0, 10).len(), 10);
+        assert_eq!(entry.immut().slice(0, 10).len(), 10);
         assert_eq!(entry.mut_slice(0, 10).len(), 10);
 
 
@@ -1212,10 +1233,11 @@ mod tests {
         let mut prev_block_id = BlockId::new();
         let mut prev_entry_id = 0;
 
-        let mut entry2 = block.get_version_entry_mut(entry_id2).expect("No entry with specified id");
+        let mut entry2_immut = block.get_version_entry(entry_id2).expect("No entry with specified id");
+        assert_eq!(entry2_immut.get_main_storage_ptr(), (ms_block_id, ms_entry_id));
+        assert_eq!(entry2_immut.get_prev_created_entry_ptr(), (prev_block_id, prev_entry_id));
 
-        assert_eq!(entry2.get_main_storage_ptr(), (ms_block_id, ms_entry_id));
-        assert_eq!(entry2.get_prev_created_entry_ptr(), (prev_block_id, prev_entry_id));
+        let mut entry2 = block.get_version_entry_mut(entry_id2).expect("No entry with specified id");
 
         prev_block_id.file_id = 345;
         prev_block_id.extent_id = 45;
@@ -1228,17 +1250,18 @@ mod tests {
         entry2.set_main_storage_ptr(&ms_block_id, ms_entry_id);
         entry2.set_prev_created_entry_ptr(&prev_block_id, prev_entry_id);
 
-        assert_eq!(entry2.get_main_storage_ptr(), (ms_block_id, ms_entry_id));
-        assert_eq!(entry2.get_prev_created_entry_ptr(), (prev_block_id, prev_entry_id));
-
         let inner_len = entry2.data.len() - VERENTRY_HEADER_LEN;
         assert_eq!(entry2.inner_entry().data.len(), inner_len);
 
         block.restore_entry(&entry4);
         let entry = block.get_entry_mut(entry_id).expect("No entry with specified id");
-        assert_eq!(b, entry.slice(0, 10)[0]);
+        assert_eq!(b, entry.immut().slice(0, 10)[0]);
         assert_eq!(block_size - DBLOCK_HEADER_LEN - 6 - entry_sz - entry_sz2, block.get_free_space());
         assert_eq!(entry_sz + entry_sz2, block.get_used_space());
+
+        let mut entry2_immut = block.get_version_entry(entry_id2).expect("No entry with specified id");
+        assert_eq!(entry2_immut.get_main_storage_ptr(), (ms_block_id, ms_entry_id));
+        assert_eq!(entry2_immut.get_prev_created_entry_ptr(), (prev_block_id, prev_entry_id));
 
 
         let c = 244;
@@ -1251,7 +1274,7 @@ mod tests {
 
         let mut entry2 = block.get_version_entry_mut(entry_id2).expect("No entry with specified id");
         entry2.copy_from_mut(&entry5);
-        assert_eq!(entry2.inner_entry().slice(0, 10)[0], c);
+        assert_eq!(entry2.inner_entry().immut().slice(0, 10)[0], c);
 
         block.delete_entry(entry_id);
         assert_eq!(block_size - DBLOCK_HEADER_LEN - 6 - entry_sz2, block.get_free_space());

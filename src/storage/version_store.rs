@@ -176,6 +176,7 @@ impl VersionStore {
             std::thread::sleep(Duration::from_millis(RECLAIM_SLEEP_INTERVAL_MS));
 
             let last_change_date = std::cmp::min(epoch_as_secs() - retain_timespan, trn_repo.get_earliest_start_time());
+println!("lcd {}", last_change_date);
             if let Err(e) = block_allocator.free_versioning_extents(last_change_date) {
                 error!("Failed to reclaim version store space: {}", e);
             }
@@ -208,7 +209,7 @@ impl<'a> Iterator<'a> {
         {
             Ok(None)
         } else {
-            let mut block = self.version_store.block_mgr.get_block_mut(&self.last_ver_block_id)?;
+            let block = self.version_store.block_mgr.get_block_mut(&self.last_ver_block_id)?;
             let entry = block.get_version_entry(self.last_ver_entry_id)?;
 
             let (last_ver_block_id, last_ver_entry_id) = entry.get_prev_created_entry_ptr();
@@ -250,7 +251,7 @@ impl VersioningStoreEntryAllocator {
         let block_id = BlockId {
             file_id,
             extent_id,
-            block_id: 0,
+            block_id: block_mgr.calc_extent_fi_block_num(extent_size as usize) as u16 + 1,
         };
 
         let used_space          = Arc::new(AtomicUsize::new(2 + DBLOCK_HEADER_LEN));
@@ -321,7 +322,7 @@ impl VersioningStoreEntryAllocator {
     }
 
     fn calc_next_block_id(&self) -> Result<BlockId, Error> {
-        let lock = self.lock.lock().unwrap();
+        let mut lock = self.lock.lock().unwrap();
         let AllocatorState {
             mut block_id,
             extent_size,
@@ -345,9 +346,11 @@ impl VersioningStoreEntryAllocator {
             block_id.file_id = file_id;
             block_id.extent_id = extent_id;
             block_id.block_id = 0;
+            lock.extent_size = extent_size;
         }
 
         self.used_space.store(DBLOCK_HEADER_LEN + 2, Ordering::Relaxed);
+        lock.block_id = block_id;
 
         Ok(block_id)
     }
@@ -394,6 +397,7 @@ impl TrnRepo {
             Some((block_id, entry_id))
         } else {
             let start_time = std::cmp::max(cur_time, if body.start_time.len() > 0 {body.start_time[0]} else {self.get_earliest_start_time()});
+            body.trn_map.insert(tsn, (block_id, entry_id, start_time));
             let pos = body.start_time.binary_search(&start_time).unwrap_or_else(|x| x);
             body.start_time.insert(pos, start_time);
             None

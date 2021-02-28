@@ -21,7 +21,7 @@ const PINLOCK_BIT: u64      = 0x8000000000000000;  // if set then block can't be
 const PIN_COUNTER_MASK: u64 = 0x0fffffffffffffff;  // bits dedicated for counting pins.
 
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct BlockDesc {
     pub id: usize,
     pub block_id: BlockId,
@@ -32,7 +32,7 @@ pub struct BlockDesc {
 }
 
 
-#[derive(Clone, Copy, PartialEq, Hash)]
+#[derive(Clone, Copy, PartialEq, Hash, Debug)]
 pub enum BlockType {
     NotUsed,
     DataBlock,

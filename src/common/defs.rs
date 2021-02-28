@@ -109,7 +109,7 @@ impl Sequence {
     }
 
     pub fn get_next(&self) -> u64 {
-        self.sn.fetch_add(1, Ordering::Relaxed)
+        self.sn.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn get_cur(&self) -> u64 {

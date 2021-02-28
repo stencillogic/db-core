@@ -411,12 +411,8 @@ impl DataStore {
         Ok(())
     }
 
-
-    // private
-
-
-    // calc number of fi blocks for extent.
-    fn calc_extent_fi_block_num(&self, extent_size: usize) -> usize {
+    /// Return number of free info blocks for an extent of a certain size.
+    pub fn calc_extent_fi_block_num(&self, extent_size: usize) -> usize {
         // we don't subtract header and fi blocks from extent size that means unused fi block can
         // be created.
         let byte_sz = (extent_size + 1) / 8;
@@ -428,6 +424,10 @@ impl DataStore {
             0
         }
     }
+
+
+    // private
+
 
     // calc number of fi blocks for file.
     fn calc_file_fi_block_num(&self, max_extent_num: usize) -> usize {

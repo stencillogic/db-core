@@ -388,9 +388,9 @@ mod tests {
         assert_eq!(block_id, block.get_id());
 
         let block = ba.get_free_checkpoint_block(checkpoint_csn).expect("Failed to get checkpoint block");
-        assert_eq!(BlockId::init(0, 0, 1), block.get_id());
+        assert_eq!(BlockId::init(0, 0, 2), block.get_id());
         drop(block);
         let block = ba.get_free_checkpoint_block(checkpoint_csn+1).expect("Failed to get checkpoint block");
-        assert_eq!(BlockId::init(1, 0, 2), block.get_id());
+        assert_eq!(BlockId::init(1, 0, 3), block.get_id());
     }
 }

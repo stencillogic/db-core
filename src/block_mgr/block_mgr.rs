@@ -132,6 +132,7 @@ impl BlockMgr {
     pub fn get_block_mut_no_lock(&self, block_id: &BlockId) -> Result<DataBlock, Error> {
 
         if let Some((data, buf_idx)) = self.buf_mgr.get_block(&block_id) {
+            self.set_dirty(buf_idx, true);
             Ok(DataBlock::new(*block_id, buf_idx, data))
         } else {
             let block_type = self.determine_block_type(&block_id);
@@ -168,6 +169,7 @@ impl BlockMgr {
         };
 
         if let Some((data, buf_idx)) = self.buf_mgr.get_block(&block_id) {
+            self.set_dirty(buf_idx, true);
             Ok(BlockLockedMut::new(BlockLocked::new(lock_holder, init_fun(*block_id, buf_idx, data))))
         } else {
             drop(lock_holder);
@@ -231,6 +233,7 @@ impl BlockMgr {
     /// take a free block from the buffer, assign the specified block_id, for it and return.
     pub fn allocate_on_cache_mut_no_lock(&self, block_id: BlockId, block_type: BlockType) -> Result<DataBlock, Error> {
         let (mut data, buf_idx) = self.allocate_on_cache(block_id, block_type);
+        self.set_dirty(buf_idx, true);
         for b in data.deref_mut().deref_mut() {*b = 0;};
         Ok(DataBlock::new(block_id, buf_idx, data))
     }
@@ -291,6 +294,11 @@ impl BlockMgr {
     /// Add a new file to datastore.
     pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
         self.ds.add_datafile(file_type, extent_size, extent_num, max_extent_num)
+    }
+
+    /// Return number of free info blocks for an extent of a certain size.
+    pub fn calc_extent_fi_block_num(&self, extent_size: usize) -> usize {
+        self.ds.calc_extent_fi_block_num(extent_size)
     }
 }
 

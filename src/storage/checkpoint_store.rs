@@ -51,7 +51,6 @@ impl CheckpointStore {
     /// Add block to checkpoint store.
     pub fn add_block(&self, block: &BlockLockedMut<DataBlock>, checkpoint_csn: u64) -> Result<(), Error> {
         let mut tgt_block = self.block_allocator.get_free_checkpoint_block(checkpoint_csn)?;
-
         tgt_block.copy_from(&block);
         tgt_block.set_original_id(block.get_id());
         self.block_mgr.set_checkpoint_block_id(block.get_buf_idx(), tgt_block.get_id());
@@ -83,7 +82,7 @@ impl<'a> Iterator<'a> {
         Iterator {
             block_mgr,
             file_desc,
-            cur_extent_id: (checkpoint_csn & 0x1) as u16,
+            cur_extent_id: (checkpoint_csn & 0x1) as u16 + 1,   // avoid extent 0 by adding 1
             cur_block_id: 0,
             checkpoint_csn,
             cur_file_idx: 0,
@@ -93,8 +92,8 @@ impl<'a> Iterator<'a> {
     pub fn get_next(&mut self) -> Result<Option<(BlockId, BlockLocked<DataBlock>)>, Error> {
         while let Some(block_id) = self.calc_next_block_id() {
             let block = self.block_mgr.get_block(&block_id)?;
-            if block.get_checkpoint_csn() > self.checkpoint_csn {
-                return Ok(Some((block.get_id(), block)));
+            if block.get_checkpoint_csn() == self.checkpoint_csn {
+                return Ok(Some((block.get_original_id(), block)));
             }
         }
 
