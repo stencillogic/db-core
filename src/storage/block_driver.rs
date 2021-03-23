@@ -759,7 +759,7 @@ mod tests {
         c.set_writer_num(2);
         drop(c);
 
-        let init_fdesc = init_datastore(dspath, block_size);
+        let _init_fdesc = init_datastore(dspath, block_size);
 
         let bd = BlockStorageDriver::new(conf.clone(), csns.clone()).expect("Block driver not created");
         let ss = bd.get_shared_state().expect("Failed to get shared state");

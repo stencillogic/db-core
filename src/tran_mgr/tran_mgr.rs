@@ -25,6 +25,7 @@ pub struct TranMgr {
 }
 
 impl TranMgr {
+
     pub fn new(conf: ConfigMt) -> Result<Self, Error> {
 
         let conf = conf.get_conf();
@@ -52,10 +53,12 @@ impl TranMgr {
         })
     }
 
+    /// Set initial tsn.
     pub fn set_tsn(&self, tsn: u64) {
         self.tsn.store(tsn, Ordering::Relaxed);
     }
 
+    /// Register a new transaction and return its tsn.
     pub fn start_tran(&self) -> u64 {
         let tsn = self.get_next_tsn();
 
@@ -66,6 +69,7 @@ impl TranMgr {
         tsn
     }
 
+    /// Unregister transaction with specified tsn.
     pub fn delete_tran(&self, tsn: u64) {
         let b = (tsn % self.nbkt as u64) as usize;
         let (lock, cvar) = &self.trn_set[b];
@@ -74,6 +78,7 @@ impl TranMgr {
         cvar.notify_all();
     }
 
+    /// Lock an object with certain object id in transaction with specified tsn.
     pub fn lock_object<'a>(&'a self, tsn: u64, obj_id: &'a ObjectId) -> ObjectLockGuard<'a> {
         let b = obj_id.obj_bkt(self.nobj_bkt);
         let (lock, cvar) = &self.obj_locks[b];
@@ -95,6 +100,8 @@ impl TranMgr {
         }
     }
 
+    /// Wait for transaction with specified tsn and timeout in milliseconds to finish.
+    /// In case of timeout returns false, otherwise true.
     pub fn wait_for(&self, tsn: u64, timeout: i64) -> bool {
         let b = (tsn % self.nbkt as u64) as usize;
         let (lock, cvar) = &self.trn_set[b];
@@ -140,5 +147,39 @@ impl<'a> Drop for ObjectLockGuard<'a> {
 
     fn drop(&mut self) {
         self.trman.unlock_object(self.obj_id);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_tran_mgr() {
+
+        let mut conf = ConfigMt::new();
+        let mut c = conf.get_conf();
+        drop(c);
+
+        let tm = TranMgr::new(conf).expect("Failed to create transaction manager");
+
+        let tsn = 1;
+        let obj = ObjectId::init(1,1,1,1);
+
+        tm.set_tsn(tsn);
+
+        let tsn = tm.start_tran();
+        let lock = tm.lock_object(tsn, &obj);
+        assert!(!tm.wait_for(tsn, 100));
+        tm.delete_tran(tsn);
+
+        let tsn = tsn + 1;
+        let tsn = tm.start_tran();
+        let lock = tm.lock_object(tsn, &obj);
+        tm.delete_tran(tsn);
+
+        assert!(tm.wait_for(tsn, 100));
     }
 }

@@ -543,8 +543,9 @@ impl<T> DoubleBuf<T> {
             for buf_id in 0..2 {
 
                 if ! sealed[buf_id] {
-
-                    self.flush_buf(buf_id);
+                    if self.bufs[buf_id].reserve_rest() {
+                        self.set_buf_readable(buf_id);
+                    }
                 }
             }
 

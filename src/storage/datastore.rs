@@ -967,6 +967,7 @@ mod tests {
         let block_buf = BlockArea::new(alloc_buf(block_size).expect("Allocation failure"), block_size);
         let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(block_buf.clone(), &stub_pin));
         ds.write_block(&mut db, FileState::InUse).expect("Failed to write block to disk");
+        drop(db);
         dealloc_buf(block_buf.data_ptr(), block_size);
 
         let mut files = Vec::new();

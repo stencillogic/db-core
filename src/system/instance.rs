@@ -512,19 +512,75 @@ pub struct InstanceSharedState {
 mod tests {
 
     use super::*;
+    use crate::storage::datastore::FileState;
+    use crate::storage::datastore::FileType;
+    use crate::storage::datastore::FileDesc;
+    use std::path::Path;
 
-    #[test]
-    fn test() {
-        assert_eq!(1, 1);
+    fn init_datastore(dspath: &str, block_size: usize) -> Vec<FileDesc> {
+
+        if Path::new(dspath).exists() {
+            std::fs::remove_dir_all(dspath).expect("Failed to delete test dir on cleanup");
+        }
+        std::fs::create_dir(dspath).expect("Failed to create test dir");
+
+        let mut fdset = vec![];
+        let desc1 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        3,
+            extent_size:    16,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::DataStoreFile,
+        };
+        let desc2 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        4,
+            extent_size:    10,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::VersioningStoreFile,
+        };
+        let desc3 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        5,
+            extent_size:    10,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::CheckpointStoreFile,
+        };
+
+        fdset.push(desc1);
+        fdset.push(desc2);
+        fdset.push(desc3);
+
+        Instance::initialize_datastore(dspath, block_size, &fdset).expect("Failed to init datastore");
+        fdset
     }
-/*
-    #[test]
-    fn test_create_and_destroy() {
-        let conf = ConfigMt::new();
+
+/*    #[test]
+    fn test_instance() {
+        let dspath = "/tmp/test_instance_098123";
+        let log_dir = "/tmp/test_instance_56445";
+        let block_size = 8192;
+
+        let _init_fdesc = init_datastore(dspath, block_size);
+
+        if Path::new(log_dir).exists() {
+            std::fs::remove_dir_all(log_dir).expect("Failed to delete test dir on cleanup");
+        }
+        std::fs::create_dir(log_dir).expect("Failed to create test dir");
+
+        let mut conf = ConfigMt::new();
+        let mut c = conf.get_conf();
+        c.set_log_dir(log_dir.to_owned());
+        c.set_datastore_path(dspath.to_owned());
+        drop(c);
+
         let instance = Instance::new(conf).expect("Failed to create instance");
     }
-
-
+*/
+/*
     #[test]
     fn test_send_to_thrread() {
         let conf = ConfigMt::new();

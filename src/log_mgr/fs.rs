@@ -50,6 +50,9 @@ impl FileStream {
         let offset = if start_pos < min_offset { min_offset } else { start_pos };
 
         let rotation = if enable_rotation {
+            if !FileOps::build_file_name(&log_dir, file_id + 1).exists() {
+                let _next_file = FileOps::create_log_file(&log_dir, file_id+1, max_file_size, false);
+            }
             Some(FileRotation::new(&log_dir, max_file_size))
         } else {
             None
@@ -67,7 +70,6 @@ impl FileStream {
         })
     }
 
-    #[inline]
     pub fn get_cur_pos(&mut self) -> std::io::Result<u64> {
         Ok(self.f.seek(SeekFrom::Current(0))?)
     }
@@ -76,11 +78,10 @@ impl FileStream {
         let file_id = self.file_id + 1;
 
         let mut file = PathBuf::from(&self.log_dir);
-        file.set_file_name(LOG_FILE_PREFIX);
+        file.push(LOG_FILE_PREFIX);
         file.set_extension(file_id.to_string());
 
         if let Some(rotation) = &self.rotation {
-
             if !file.exists() {
                 rotation.wait_for_file(file_id);
             }
@@ -118,7 +119,7 @@ impl Write for FileStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
 
         if self.offset > self.max_file_size {
-            self.reopen()?
+            self.reopen()?;
         }
 
         let ret = self.f.write(buf);
@@ -223,7 +224,6 @@ impl BufferedFileStream {
             }
 
             if terminate.load(Ordering::Relaxed) {
-
                 buf.set_buf_terminated(buf_id);
 
                 terminated_cnt += 1;
@@ -271,27 +271,26 @@ impl FileRotation {
                 let mut file_id = 0;
 
                 let mut check = |val: &FileRotationReq| -> bool {
-
                     match *val {
                         FileRotationReq::CreateFile(val) => {
                             file_id = val;
-                            return true;
+                            return false;
                         },
                         FileRotationReq::Terminate => {
                             terminate = true;
-                            return true;
+                            return false;
                         },
-                        FileRotationReq::Noop => return false,
+                        FileRotationReq::Noop => return true,
                     }
                 };
 
                 let mut locked_val = new_file_req2.wait_for(&mut check);
                 *locked_val = FileRotationReq::Noop;
-
                 if terminate {
                     return;
                 } else {
-                    if let Err(e) = FileOps::create_log_file(&log_dir2, file_id, max_file_size, false) {
+                    let res = FileOps::create_log_file(&log_dir2, file_id, max_file_size, false);
+                    if let Err(e) = res {
                         error!("Failed to create a new log file {}", e);
                     } else {
                         file_created2.send(file_id, true);
@@ -308,7 +307,7 @@ impl FileRotation {
     }
 
     pub fn wait_for_file(&self, file_id: u32) {
-        let mut check = |val: &u32| -> bool {*val == file_id};
+        let mut check = |val: &u32| -> bool {*val != file_id};
         let mut locked_val = self.file_created.wait_for(&mut check);
         *locked_val = 0;
     }
@@ -324,7 +323,7 @@ impl FileRotation {
 }
 
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum FileRotationReq {
     Noop,
     CreateFile(u32),
@@ -383,12 +382,12 @@ impl FileOps {
     pub fn build_file_name(log_dir: &str, file_id: u32) -> PathBuf {
 
         let mut file = PathBuf::from(log_dir);
-        file.set_file_name(LOG_FILE_PREFIX);
+        file.push(LOG_FILE_PREFIX);
         file.set_extension(file_id.to_string());
         file
     }
 
-    pub fn create_log_file(log_dir: &str, file_id: u32, size: u32, mark_online: bool) -> Result<(), Error>  {
+    pub fn create_log_file(log_dir: &str, file_id: u32, size: u32, mark_online: bool) -> Result<(), Error> {
         let file = FileOps::build_file_name(log_dir, file_id);
 
         let mut f = OpenOptions::new()
@@ -403,6 +402,8 @@ impl FileOps {
         if mark_online {
             f.write_all(&[LOG_FILE_ONLINE_BIT])?;
         }
+
+        f.sync_all()?;
 
         Ok(())
     }
@@ -432,8 +433,8 @@ impl FileOps {
 
         let file_id = FileOps::find_latest_log_file(log_dir)?;
         if file_id == 0 {
-            if !FileOps::build_file_name(&log_dir, file_id).exists() {
-                FileOps::create_log_file(log_dir, file_id, file_size, true)?;
+            if !FileOps::build_file_name(&log_dir, 1).exists() {
+                FileOps::create_log_file(log_dir, 1, file_size, true)?;
             }
         }
 
@@ -441,3 +442,62 @@ impl FileOps {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_file_stream() {
+        let log_dir = "/tmp/test_fs_435354345";
+        let max_file_size = 100;
+        let file_id = 1;
+        let start_pos = 0;
+        let enable_rotation = true;
+        let buf_sz = 100;
+
+        if Path::new(log_dir).exists() {
+            std::fs::remove_dir_all(log_dir).expect("Failed to delete test dir on cleanup");
+        }
+        std::fs::create_dir(log_dir).expect("Failed to create test dir");
+
+
+        FileOps::init_file_logging(log_dir, max_file_size).expect("Failed to init logging");
+
+
+        // FileStream
+
+
+        let mut fs = FileStream::new(log_dir.to_owned(), max_file_size, file_id, start_pos, enable_rotation).expect("Failed to create file stream");
+        assert_eq!(fs.get_cur_pos().unwrap(), 4);
+
+        let buf = [1,2,3,4,5,6,7,8,0,1,2,3,4,5];
+        fs.write_all(&buf).unwrap();
+        fs.flush().unwrap();
+
+        assert_eq!(fs.get_cur_pos().unwrap(), buf.len() as u64 + 4);
+
+        for _ in 0..20 {
+            fs.write_all(&buf).unwrap();
+        }
+        fs.flush().unwrap();
+
+        fs.terminate();
+
+
+        // BufferedFileStream
+
+
+        let bfs = BufferedFileStream::new(log_dir.to_owned(), max_file_size, buf_sz, 2, (11 * buf.len() + 4) as u32).expect("Failed to create BufferedFileStream");
+
+        for _ in 0..20 {
+            let mut slice = bfs.get_for_write(buf.len()).unwrap();
+            (&mut slice).copy_from_slice(&buf);
+        }
+        bfs.flush();
+
+        bfs.terminate();
+    }
+
+}
