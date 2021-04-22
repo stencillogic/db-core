@@ -36,12 +36,13 @@ pub struct FileStream {
 
 impl FileStream {
 
-    pub fn new(log_dir: String, max_file_size: u32, file_id: u32, start_pos: u32, enable_rotation: bool) -> Result<FileStream, Error> {
+    pub fn new(log_dir: String, max_file_size: u32, file_id: u32, start_pos: u32, enable_rotation: bool, read: bool) -> Result<FileStream, Error> {
 
         let file = FileOps::build_file_name(&log_dir, file_id);
 
         let mut f = OpenOptions::new()
             .create(false)
+            .read(read)
             .write(true)
             .truncate(false)
             .open(file)?;
@@ -169,7 +170,7 @@ impl BufferedFileStream {
 
         let db2 = db.clone();
 
-        let fs = FileStream::new(log_dir, max_file_size, file_id, start_pos, true)?;
+        let fs = FileStream::new(log_dir, max_file_size, file_id, start_pos, true, false)?;
 
         let retry_duration = Duration::new(RETRY_DURATION_SEC, 0);
 
@@ -411,7 +412,8 @@ impl FileOps {
     pub fn check_if_online(path: &Path) -> std::io::Result<bool> {
         let mut f = OpenOptions::new()
             .create(false)
-            .write(true)
+            .read(true)
+            .write(false)
             .truncate(false)
             .open(path)?;
 
@@ -436,9 +438,10 @@ impl FileOps {
             if !FileOps::build_file_name(&log_dir, 1).exists() {
                 FileOps::create_log_file(log_dir, 1, file_size, true)?;
             }
+            Ok(1)
+        } else {
+            Ok(file_id)
         }
-
-        Ok(file_id)
     }
 }
 
@@ -469,7 +472,7 @@ mod tests {
         // FileStream
 
 
-        let mut fs = FileStream::new(log_dir.to_owned(), max_file_size, file_id, start_pos, enable_rotation).expect("Failed to create file stream");
+        let mut fs = FileStream::new(log_dir.to_owned(), max_file_size, file_id, start_pos, enable_rotation, false).expect("Failed to create file stream");
         assert_eq!(fs.get_cur_pos().unwrap(), 4);
 
         let buf = [1,2,3,4,5,6,7,8,0,1,2,3,4,5];

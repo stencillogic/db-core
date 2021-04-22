@@ -18,6 +18,7 @@ const OBJECT_ID_WRITE_SZ: usize = 2 * 4;
 const LRH_WRITE_SZ: usize = 8 * 4 + 1 + 4;
 
 
+#[derive(Debug)]
 pub struct LogRecordHeader {
     pub lsn:            u64,
     pub csn:            u64,
@@ -40,7 +41,7 @@ impl LogRecordHeader {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone, Copy)]
+#[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub enum RecType {
     Unspecified = 0,
     Commit = 1,
@@ -73,17 +74,18 @@ impl LogWriter {
         let mut lrh = self.prepare_lrh(csn, checkpoint_csn, tsn, RecType::Data);
         LogOps::calc_obj_id_crc(&mut lrh.crc32, obj);
         lrh.crc32 = crc32::crc32_num(lrh.crc32, pos);
+        lrh.crc32 = crc32::crc32_num(lrh.crc32, data.len() as u32);
         lrh.crc32 = crc32::crc32_arr(lrh.crc32, data);
         lrh.crc32 = crc32::crc32_finalize(lrh.crc32);
 
         let mut dst_locked = self.out_stream.get_for_write(LRH_WRITE_SZ + OBJECT_ID_WRITE_SZ + 8 + 4 + data.len()).unwrap();
         let mut slice: &mut [u8] = &mut dst_locked;
 
-        self.write_header(&lrh, slice)?;
-        self.write_obj_id(obj, slice)?;
-        slice.write(&pos.to_ne_bytes())?;
-        slice.write(&(data.len() as u32).to_ne_bytes())?;
-        slice.write(data)?;
+        self.write_header(&lrh, &mut slice)?;
+        self.write_obj_id(obj, &mut slice)?;
+        slice.write_all(&pos.to_ne_bytes())?;
+        slice.write_all(&(data.len() as u32).to_ne_bytes())?;
+        slice.write_all(data)?;
         slice.flush()?;
 
         drop(dst_locked);
@@ -110,8 +112,8 @@ impl LogWriter {
         let mut dst_locked = self.out_stream.get_for_write(LRH_WRITE_SZ + 8).unwrap();
         let mut slice: &mut [u8] = &mut dst_locked;
 
-        self.write_header(&lrh, slice)?;
-        slice.write(&latest_commit_csn.to_ne_bytes())?;
+        self.write_header(&lrh, &mut slice)?;
+        slice.write_all(&latest_commit_csn.to_ne_bytes())?;
         slice.flush()?;
         drop(dst_locked);
 
@@ -128,8 +130,8 @@ impl LogWriter {
         let mut dst_locked = self.out_stream.get_for_write(LRH_WRITE_SZ + 8).unwrap();
         let mut slice: &mut [u8] = &mut dst_locked;
 
-        self.write_header(&lrh, slice)?;
-        slice.write(&latest_commit_csn.to_ne_bytes())?;
+        self.write_header(&lrh, &mut slice)?;
+        slice.write_all(&latest_commit_csn.to_ne_bytes())?;
         slice.flush()?;
         drop(dst_locked);
 
@@ -140,52 +142,52 @@ impl LogWriter {
 
 
     pub fn write_delete(&self, csn: u64, checkpoint_csn: u64, tsn: u64, obj: &ObjectId) -> Result<(), Error> {
-        let mut lrh = self.prepare_lrh(csn, checkpoint_csn, tsn, RecType::Data);
+        let mut lrh = self.prepare_lrh(csn, checkpoint_csn, tsn, RecType::Delete);
         LogOps::calc_obj_id_crc(&mut lrh.crc32, obj);
         lrh.crc32 = crc32::crc32_finalize(lrh.crc32);
 
         let mut dst_locked = self.out_stream.get_for_write(LRH_WRITE_SZ + 8).unwrap();
-        let slice: &mut [u8] = &mut dst_locked;
+        let mut slice: &mut [u8] = &mut dst_locked;
 
-        self.write_header(&lrh, slice)?;
-        self.write_obj_id(obj, slice)?;
+        self.write_header(&lrh, &mut slice)?;
+        self.write_obj_id(obj, &mut slice)?;
 
         drop(dst_locked);
 
         Ok(())
     }
-
 
     fn write_header_only_rec(&self, csn: u64, checkpoint_csn: u64, tsn: u64, rec_type: RecType) -> Result<u64, Error>  {
         let mut lrh = self.prepare_lrh(csn, checkpoint_csn, tsn, rec_type);
         lrh.crc32 = crc32::crc32_finalize(lrh.crc32);
 
         let mut dst_locked = self.out_stream.get_for_write(LRH_WRITE_SZ).unwrap();
-        self.write_header(&lrh, &mut dst_locked)?;
+        let mut slice: &mut [u8] = &mut dst_locked;
+        self.write_header(&lrh, &mut slice)?;
         drop(dst_locked);
 
         Ok(lrh.lsn)
     }
 
-    fn write_header(&self, lrh: &LogRecordHeader, mut slice: &mut [u8]) -> std::io::Result<()> {
-        slice.write(&lrh.lsn.to_ne_bytes())?;
-        slice.write(&lrh.csn.to_ne_bytes())?;
-        slice.write(&lrh.checkpoint_csn.to_ne_bytes())?;
-        slice.write(&lrh.tsn.to_ne_bytes())?;
-        slice.write(&[(lrh.rec_type as u8)])?;
-        slice.write(&lrh.crc32.to_ne_bytes())?;
-        slice.flush()?;
-        
+    fn write_header(&self, lrh: &LogRecordHeader, slice: &mut &mut [u8]) -> std::io::Result<()> {
+        (*slice).write_all(&lrh.lsn.to_ne_bytes())?;
+        (*slice).write_all(&lrh.csn.to_ne_bytes())?;
+        (*slice).write_all(&lrh.checkpoint_csn.to_ne_bytes())?;
+        (*slice).write_all(&lrh.tsn.to_ne_bytes())?;
+        (*slice).write_all(&[(lrh.rec_type as u8)])?;
+        (*slice).write_all(&lrh.crc32.to_ne_bytes())?;
+        (*slice).flush()?;
+
         Ok(())
     }
 
-    fn write_obj_id(&self, obj: &ObjectId, mut slice: &mut [u8]) -> std::io::Result<()> {
-        slice.write(&obj.file_id.to_ne_bytes())?;
-        slice.write(&obj.extent_id.to_ne_bytes())?;
-        slice.write(&obj.block_id.to_ne_bytes())?;
-        slice.write(&obj.entry_id.to_ne_bytes())?;
-        slice.flush()?;
-        
+    fn write_obj_id(&self, obj: &ObjectId, slice: &mut &mut [u8]) -> std::io::Result<()> {
+        (*slice).write_all(&obj.file_id.to_ne_bytes())?;
+        (*slice).write_all(&obj.extent_id.to_ne_bytes())?;
+        (*slice).write_all(&obj.block_id.to_ne_bytes())?;
+        (*slice).write_all(&obj.entry_id.to_ne_bytes())?;
+        (*slice).flush()?;
+
         Ok(())
     }
 
@@ -259,10 +261,11 @@ impl LogReader {
 
             if lrh.rec_type == RecType::CheckpointBegin {
                 start_seek_pos = self.fs.get_cur_pos()?;
-                csn = lrh.csn;
+                csn = lrh.checkpoint_csn;
             } else if lrh.rec_type == RecType::CheckpointCompleted {
-                if csn == lrh.csn {
+                if csn == lrh.checkpoint_csn {
                     seek_pos = start_seek_pos;
+                    self.checkpoint_csn = csn;
                 }
             }
         }
@@ -279,13 +282,12 @@ impl LogReader {
     pub fn read_next(&mut self) -> Result<Option<LogRecordHeader>, Error> {
         let data_len: u32;
         let mut crc32;
-        let mut u32_buf = [0, 0, 0, 0];
-        let mut u64_buf = [0, 0, 0, 0, 0, 0, 0, 0];
+        let mut u32_buf = [0u8; 4];
+        let mut u64_buf = [0u8; 8];
         let mut latest_commit_csn = 0;
         let mut checkpoint_csn = 0;
 
         match self.read_header() {
-
             Ok(lrh) => {
                 crc32 = crc32::crc32_begin();
                 LogOps::calc_header_crc(&mut crc32, &lrh);
@@ -299,6 +301,8 @@ impl LogReader {
                     RecType::CheckpointBegin => {
                         self.fs.read_exact(&mut u64_buf)?;
                         checkpoint_csn = u64::from_ne_bytes(u64_buf);
+                        crc32 = crc32::crc32_num(crc32, checkpoint_csn);
+
                         if self.latest_commit_csn < checkpoint_csn {
                             latest_commit_csn = checkpoint_csn;
                         }
@@ -306,6 +310,8 @@ impl LogReader {
                     RecType::CheckpointCompleted => {
                         self.fs.read_exact(&mut u64_buf)?;
                         checkpoint_csn = u64::from_ne_bytes(u64_buf);
+                        crc32 = crc32::crc32_num(crc32, checkpoint_csn);
+
                         if self.latest_commit_csn < checkpoint_csn {
                             latest_commit_csn = checkpoint_csn;
                         }
@@ -316,9 +322,11 @@ impl LogReader {
 
                         self.fs.read_exact(&mut u64_buf)?;
                         self.data_pos = u64::from_ne_bytes(u64_buf);
+                        crc32 = crc32::crc32_num(crc32, self.data_pos);
 
                         self.fs.read_exact(&mut u32_buf)?;
                         data_len = u32::from_ne_bytes(u32_buf);
+                        crc32 = crc32::crc32_num(crc32, data_len);
 
                         if data_len > 0 {
                             self.data_buf.resize(data_len as usize, 0);
@@ -385,10 +393,9 @@ impl LogReader {
     fn read_header(&mut self) -> Result<LogRecordHeader, Error> {
         let mut lrh = LogRecordHeader::new();
 
-        let mut u32_buf = [0, 0, 0, 0];
-        let mut u64_buf = [0, 0, 0, 0, 0, 0, 0, 0];
-        let mut byte = [0];
-
+        let mut u32_buf = [0u8; 4];
+        let mut u64_buf = [0u8; 8];
+        let mut byte = [0u8];
         self.fs.read_exact(&mut u64_buf)?;
         lrh.lsn = u64::from_ne_bytes(u64_buf);
         self.fs.read_exact(&mut u64_buf)?;
@@ -415,15 +422,15 @@ impl LogReader {
     }
 
     fn read_object_id(&mut self) -> Result<ObjectId, Error> {
-        let mut u64_buf = [0, 0, 0, 0, 0, 0, 0, 0];
+        let mut u64_buf = [0u8; 8];
         let mut ret = ObjectId::new();
 
         self.fs.read_exact(&mut u64_buf)?;
 
         ret.file_id = u16::slice_to_int(&u64_buf[0..2]).unwrap();
         ret.extent_id = u16::slice_to_int(&u64_buf[2..4]).unwrap();
-        ret.block_id = u16::slice_to_int(&u64_buf[5..6]).unwrap();
-        ret.entry_id = u16::slice_to_int(&u64_buf[7..8]).unwrap();
+        ret.block_id = u16::slice_to_int(&u64_buf[4..6]).unwrap();
+        ret.entry_id = u16::slice_to_int(&u64_buf[6..8]).unwrap();
 
         Ok(ret)
     }
@@ -450,4 +457,5 @@ impl LogOps {
         *crc32 = crc32::crc32_num(*crc32, obj.entry_id);
     }
 }
+
 
