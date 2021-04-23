@@ -359,14 +359,16 @@ pub struct FiDataIter<'a> {
 impl FiDataIter<'_> {
 
     fn analyze_u64(&self, mut val: u64, starting_bit: u16) -> u16 {
-        let mut pos = 0;
+        let mut byte_starting_bit = starting_bit % 8;
+        let mut pos = starting_bit - byte_starting_bit;
         for _ in 0..8 {
-            let inc = self.anaylyze_u8(val as u8, starting_bit);
+            let inc = self.anaylyze_u8(val as u8, byte_starting_bit);
             pos += inc;
             if inc < 8 {
                 break;
             }
             val >>= 8;
+            byte_starting_bit = 0;
         }
         pos
     }
@@ -401,36 +403,40 @@ impl Iterator for FiDataIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // go by u64
+        let mut starting_bit = self.scanned % 64;
         while self.fi_data.size() - self.scanned >= 64 {
             let val = self.get_u64(self.scanned / 8);
-            let inc = self.analyze_u64(val, 0);
+            let inc = self.analyze_u64(val, starting_bit);
             if inc < 64 {
-                self.scanned += inc + 1;        // point to next bit,
-                return Some(self.scanned - 1);  // and return found bit
+                self.scanned += inc - starting_bit + 1; // point to next bit,
+                return Some(self.scanned - 1);          // and return found bit
             }
-            self.scanned += 64;
+            self.scanned += 64 - starting_bit;
+            starting_bit = 0;
         }
 
         // scan remaining bytes
+        let mut starting_bit = self.scanned % 8;
         while self.fi_data.size - self.scanned >= 8 {
             let val = self.get_u8(self.scanned / 8);
-            let inc = self.anaylyze_u8(val, 0);
+            let inc = self.anaylyze_u8(val, starting_bit);
             if inc < 8 {
-                self.scanned += inc + 1;        // point to next bit,
-                return Some(self.scanned - 1);  // and return found bit
+                self.scanned += inc - starting_bit + 1; // point to next bit,
+                return Some(self.scanned - 1);          // and return found bit
             }
-            self.scanned += 8;
+            self.scanned += 8 - starting_bit;
+            starting_bit = 0;
         }
 
         // scan ramining individual bits
-        let mut bit = 0;
+        let mut bit = self.scanned as usize % 8;
         let val = self.get_u8(self.scanned / 8);
         while self.fi_data.size > self.scanned {
             if  (self.set == true  && (val & BYTE_BITS[bit] != 0)) ||
                 (self.set == false && (val & BYTE_BITS[bit] == 0))
             {
-                self.scanned += 1;              // point to next bit,
-                return Some(self.scanned - 1);  // and return found bit
+                self.scanned += 1;                      // point to next bit,
+                return Some(self.scanned - 1);          // and return found bit
             }
             bit += 1;
             self.scanned += 1;
@@ -441,3 +447,298 @@ impl Iterator for FiDataIter<'_> {
 
 }
 
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use std::path::Path;
+    use std::ops::Deref;
+    use crate::storage::datastore::FileState;
+    use crate::storage::datastore::FileType;
+    use crate::storage::datastore::FileDesc;
+    use crate::storage::datastore::DataStore;
+
+
+    fn init_datastore(dspath: &str, block_size: usize) -> Vec<FileDesc> {
+
+        let mut fdset = vec![];
+        let desc1 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        3,
+            extent_size:    16,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::DataStoreFile,
+        };
+        let desc2 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        4,
+            extent_size:    150,
+            extent_num:     2,
+            max_extent_num: 100,
+            file_type:      FileType::VersioningStoreFile,
+        };
+        let desc3 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        5,
+            extent_size:    10,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::CheckpointStoreFile,
+        };
+
+        fdset.push(desc1);
+        fdset.push(desc2);
+        fdset.push(desc3);
+
+        DataStore::initialize_datastore(dspath, block_size, &fdset).expect("Failed to init datastore");
+        fdset
+    }
+
+    fn assert_iter(iter: &mut FiDataIter, values: &[u16]) {
+        let mut values = values.iter();
+        while let Some(value) = iter.next() {
+            let v = values.next().expect("iterators lengths don't match");
+            assert_eq!(*v, value);
+        }
+    }
+
+    #[test]
+    fn test_free_info() {
+
+        let dspath = "/tmp/test_free_info_354657";
+        let block_size = 8192;
+        let block_num = 100;
+        
+        if Path::new(&dspath).exists() {
+            std::fs::remove_dir_all(&dspath).expect("Failed to delete test dir on cleanup");
+        }
+        std::fs::create_dir(&dspath).expect("Failed to create test dir");
+
+        let mut conf = ConfigMt::new();
+        let mut c = conf.get_conf();
+        c.set_datastore_path(dspath.to_owned());
+        c.set_block_mgr_n_lock(10);
+        c.set_block_buf_size(block_num*block_size as u64);
+        drop(c);
+
+        let init_fdesc = init_datastore(dspath, block_size);
+
+        let block_mgr = Rc::new(BlockMgr::new(conf.clone()).expect("Failed to create instance"));
+
+
+        // create & destroy
+
+
+        let fi = FreeInfo::new(conf, block_mgr.clone());
+        let ss = fi.get_shared_state();
+        drop(fi);
+
+        let fi = FreeInfo::from_shared_state(block_mgr.clone(), ss).expect("Failed to ");
+
+
+        let file_id = 3;
+        let extent_id = 2;
+
+
+        // check fi for file & extent
+
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_file(file_id, &mut fi_data).expect("Failed to get free info data for a file");
+        assert_eq!(3, fi_data.size());
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2]);
+
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_extent(file_id, extent_id, &mut fi_data).expect("Failed to get free info data for an extent");
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+
+        // add extent
+
+
+        fi.add_extent(file_id).expect("Failed to add extent");
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_file(file_id, &mut fi_data).expect("Failed to get free info data for a file");
+        assert_eq!(4, fi_data.size());
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2, 3]);
+
+
+        // set extent used & free
+
+
+        let set = true;
+        let extent_id = 3;
+        fi.set_extent_bit(file_id, extent_id, set).expect("Failed to set extent bit");
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_file(file_id, &mut fi_data).expect("Failed to get free info data for a file");
+        assert_eq!(4, fi_data.size());
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0, 3]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2]);
+
+
+        let set = false;
+        fi.set_extent_bit(file_id, extent_id, set).expect("Failed to set extent bit");
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_file(file_id, &mut fi_data).expect("Failed to get free info data for a file");
+        assert_eq!(4, fi_data.size());
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2, 3]);
+
+
+        // set block used & free
+
+
+        let set = true;
+        let file_id = 3;
+        let extent_id = 2;
+        let block_id = BlockId::init(file_id, extent_id, 14);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+        let block_id = BlockId::init(file_id, extent_id, 4);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_extent(file_id, extent_id, &mut fi_data).expect("Failed to get free info data for an extent");
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0, 4, 14]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]);
+
+        // check a different extent
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_extent(file_id, extent_id-1, &mut fi_data).expect("Failed to get free info data for an extent");
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+
+        let set = false;
+        let block_id = BlockId::init(file_id, extent_id, 14);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+        let block_id = BlockId::init(file_id, extent_id, 4);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_extent(file_id, extent_id, &mut fi_data).expect("Failed to get free info data for an extent");
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+
+        // long extents
+        
+
+        let set = true;
+        let file_id = 4;
+        let extent_id = 1;
+
+        let block_id = BlockId::init(file_id, extent_id, 60);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+        let block_id = BlockId::init(file_id, extent_id, 100);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+        let block_id = BlockId::init(file_id, extent_id, 149);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+
+        let mut values = vec![];
+        for i in 1..150 {
+            if ! (i == 60 || i == 100 || i == 149) {
+                values.push(i);
+            }
+        }
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_extent(file_id, extent_id, &mut fi_data).expect("Failed to get free info data for an extent");
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0, 60, 100, 149]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &values);
+
+        let set = false;
+        let file_id = 4;
+        let extent_id = 1;
+
+        let block_id = BlockId::init(file_id, extent_id, 60);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+        let block_id = BlockId::init(file_id, extent_id, 100);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+        let block_id = BlockId::init(file_id, extent_id, 149);
+        fi.set_block_bit(&block_id, set).expect("Failed to set block bit");
+
+        let mut values = vec![];
+        for i in 1..150 {
+            values.push(i);
+        }
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_extent(file_id, extent_id, &mut fi_data).expect("Failed to get free info data for an extent");
+
+        let mut iter = fi_data.used_iter();
+        assert_iter(&mut iter, &[0]);
+
+        let mut iter = fi_data.free_iter();
+        assert_iter(&mut iter, &values);
+
+
+        // full extent & free extent
+        
+
+        let set = true;
+        let extent_id = 1;
+        let file_id = 3;
+
+        let mut fi_data = FiData::new();
+        fi.get_fi_for_file(file_id, &mut fi_data).expect("Failed to get free info data for an extent");
+        assert_eq!(fi_data.fi[0] & 0x02, 0);
+
+        for i in 1..16 {
+            let block_id = BlockId::init(file_id, extent_id, i);
+            fi.set_block_bit(&block_id, set).expect("Failed to set extent bit");
+        }
+
+        fi.get_fi_for_file(file_id, &mut fi_data).expect("Failed to get free info data for an extent");
+        assert_eq!(fi_data.fi[0] & 0x02, 0x02);
+
+        let block_id = BlockId::init(file_id, extent_id, 15);
+        fi.set_block_bit(&block_id, false).expect("Failed to set extent bit");
+
+        fi.get_fi_for_file(file_id, &mut fi_data).expect("Failed to get free info data for an extent");
+        assert_eq!(fi_data.fi[0] & 0x02, 0);
+    }
+}
