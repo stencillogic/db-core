@@ -205,7 +205,7 @@ impl BlockMgr {
 
         let lid = id % self.locks.len();
 
-        let lock_holder = RwLockGuard::Read(self.locks[lid].read().unwrap());
+        let lock_holder = RwLockGuard::Write(self.locks[lid].write().unwrap());
         if let Some(data) = self.buf_mgr.get_block_by_idx(id) {
             let bdesc = self.buf_mgr.get_bdesc_by_idx(id).unwrap();
             Some(BlockLockedMut::new(BlockLocked::new(lock_holder, DataBlock::new(bdesc.block_id, id, data))))

@@ -87,7 +87,7 @@ impl BufWriter {
 
         loop {
             if let Some(mut lock) = write_ready.wait_for_interruptable(
-                &mut (|count| -> bool { *count > 0 }),
+                &mut (|count| -> bool { *count == 0 }),
                 &mut (|| -> bool { terminate.load(Ordering::Relaxed) }),
                 Duration::from_millis(CONDVAR_WAIT_INTERVAL_MS)
             ) {
@@ -127,7 +127,7 @@ impl BufWriter {
         if desc.dirty {
             if desc.block_type == BlockType::DataBlock {
                 if !desc.checkpoint_written {
-                    let mut checkpoint_block = block_mgr.get_block_mut(&desc.checkpoint_block_id)?;
+                    let mut checkpoint_block = block_mgr.get_block_mut_no_lock(&desc.checkpoint_block_id)?;
                     let checkpoint_csn = checkpoint_block.get_checkpoint_csn();
                     let actual_block_id = chkpnt_allocators.get_next_block_id(checkpoint_csn, block_mgr);
                     checkpoint_block.set_id(actual_block_id);
@@ -248,6 +248,178 @@ impl CheckpointStoreBlockAllocator {
 
             self.cur_checkpoint_csn.store(checkpoint_csn, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::storage::datastore::DataStore;
+    use crate::storage::datastore::FileType;
+    use crate::storage::datastore::FileState;
+    use crate::block_mgr::block::BasicBlock;
+    use crate::system::config::ConfigMt;
+    use crate::buf_mgr::buf_mgr::Pinned;
+    use crate::buf_mgr::buf_mgr::BlockArea;
+    use std::time::Duration;
+    use std::path::Path;
+    use std::rc::Rc;
+    use std::cell::Ref;
+
+
+    fn init_datastore(dspath: &str, block_size: usize) -> Vec<FileDesc> {
+
+        if Path::new(&dspath).exists() {
+            std::fs::remove_dir_all(&dspath).expect("Failed to delete test dir on cleanup");
+        }
+        std::fs::create_dir(&dspath).expect("Failed to create test dir");
+
+        let mut fdset = vec![];
+        let desc1 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        3,
+            extent_size:    16,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::DataStoreFile,
+        };
+        let desc2 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        4,
+            extent_size:    10,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::VersioningStoreFile,
+        };
+        let desc3 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        5,
+            extent_size:    10,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::CheckpointStoreFile,
+        };
+
+        fdset.push(desc1);
+        fdset.push(desc2);
+        fdset.push(desc3);
+
+        DataStore::initialize_datastore(dspath, block_size, &fdset).expect("Failed to init datastore");
+        fdset
+    }
+
+    #[test]
+    fn test_buf_writer() {
+        let writer_num = 2;
+        let dspath = "/tmp/test_buf_writer_34554654";
+        let block_size = 8192;
+        let block_num = 100;
+
+        let mut conf = ConfigMt::new();
+        let mut c = conf.get_conf();
+        c.set_datastore_path(dspath.to_owned());
+        c.set_block_mgr_n_lock(10);
+        c.set_block_buf_size(block_num*block_size as u64);
+        drop(c);
+
+        let init_fdesc = init_datastore(dspath, block_size);
+
+        let block_mgr = Rc::new(BlockMgr::new(conf.clone()).expect("Failed to create instance"));
+
+        let bw = BufWriter::new(&block_mgr.clone(), writer_num).expect("Failed to create buffer writers");
+
+        // prepare dirty blocks
+        let mut idxs = vec![];
+        for i in 1..3 {
+            let block_id = BlockId::init(3,1,i);
+            let mut block = block_mgr.get_block_mut(&block_id).expect("Failed to get block for write");
+            block.set_checkpoint_csn(1);
+            block.add_entry(148);
+            let idx = block.get_buf_idx();
+            idxs.push(idx);
+            let desc = block_mgr.get_block_desc(idx).unwrap();
+            assert!(desc.dirty);
+
+            // add checkpoint block to it
+            let mut c_block = block_mgr.allocate_on_cache_mut_no_lock(BlockId::init(0,0,i), BlockType::CheckpointBlock).expect("Failed to allocate block");
+            c_block.copy_from(&block);
+            c_block.set_original_id(block.get_id());
+            block_mgr.set_checkpoint_block_id(block.get_buf_idx(), c_block.get_id());
+            block_mgr.set_checkpoint_written(block.get_buf_idx(), false);
+
+            drop(c_block);
+            drop(block);
+        }
+
+
+        bw.wake_writers();
+
+        let mut i =0;
+        assert!(loop {
+            std::thread::sleep(Duration::new(2,0));
+            let mut dirty = false;
+            for idx in idxs.iter() {
+                let desc = block_mgr.get_block_desc(*idx).unwrap();
+                if desc.dirty {
+                    dirty = true;
+                }
+            }
+            if ! dirty {
+                break true;
+            }
+            i += 1;
+            if i == 30 {
+                break false;
+            }
+        }, "Writers couldn't complete in 60 secs");
+
+
+        // direct block write
+        let block_id = BlockId::init(4,1,1);
+        let mut block = block_mgr.get_block_mut(&block_id).expect("Failed to get versioning for write");
+        let idx = block.get_buf_idx();
+        block.set_checkpoint_csn(123);
+
+        bw.write_data_block(&mut block, &block_mgr, true).expect("Failed to write versioning block");
+        let desc = block_mgr.get_block_desc(idx).unwrap();
+        assert!(desc.dirty);
+
+        bw.write_data_block(&mut block, &block_mgr, false).expect("Failed to write versioning block");
+        let desc = block_mgr.get_block_desc(idx).unwrap();
+        assert!(!desc.dirty);
+
+
+        bw.terminate();
+
+        drop(block);
+        drop(block_mgr);
+
+
+        let ds = DataStore::new(conf).expect("Failed to create datastore");
+        let stub_pin =  AtomicU64::new(1000);
+        for i in 1..3 {
+            let block_id = BlockId::init(3,1,i);
+            let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
+            let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
+            assert_eq!(db.get_checkpoint_csn(), 1);
+            assert!(db.has_entry(0));
+            drop(db);
+            drop(ba);
+
+            let block_id = BlockId::init(5,2,i);
+            let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
+            let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
+            assert_eq!(db.get_checkpoint_csn(), 1);
+            assert!(db.has_entry(0));
+            drop(db);
+            drop(ba);
+        }
+
+        let block_id = BlockId::init(4,1,1);
+        let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
+        let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
+        assert_eq!(db.get_checkpoint_csn(), 123);
     }
 }
 

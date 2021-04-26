@@ -26,6 +26,8 @@ impl<T> SyncNotification<T> {
         }
     }
 
+    /// Wait while check_cond returns true.
+    /// Return associated value when check_cond returned false.
     pub fn wait_for(&self, check_cond: &mut (dyn FnMut(&T) -> bool)) -> MutexGuard<T>
         where T: PartialEq 
     {
@@ -37,6 +39,8 @@ impl<T> SyncNotification<T> {
         lock_val
     }
 
+    /// Set associated value to val and notify all or just one thread depending on notify_all
+    /// value.
     pub fn send(&self, val: T, notify_all: bool) {
         let (lock, cvar) = &(*self.pair);
         let mut lock_val = lock.lock().unwrap();
@@ -48,6 +52,9 @@ impl<T> SyncNotification<T> {
         }
     }
 
+    /// Wait while check_cond returns true and check for interrupt_cond periodically with interval
+    /// specified by timeout.
+    /// Return associated value or None if interrupt_cond returned true.
     pub fn wait_for_interruptable(&self, 
                                   check_cond: &mut (dyn FnMut(&T) -> bool), 
                                   interrupt_cond: &mut (dyn FnMut() -> bool), 

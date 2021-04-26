@@ -128,7 +128,7 @@ impl Checkpointer {
                 let mut checkpoint_csn = csns.checkpoint_csn.get_cur();
                 loop {
                     if let Some(mut lock) = checkpoint_ready.wait_for_interruptable(
-                        &mut (|state| -> bool { *state }),
+                        &mut (|state| -> bool { ! *state }),
                         &mut (|| -> bool { terminate.load(Ordering::Relaxed) }),
                         Duration::from_millis(CONDVAR_WAIT_INTERVAL_MS)
                     ) {
