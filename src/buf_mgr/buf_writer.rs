@@ -223,7 +223,7 @@ impl CheckpointStoreBlockAllocator {
         let file_id = sl.file_info[file_info_id as usize].file_id;
         let n = n / sl.file_info.len() as u64;
         let extent_size = sl.file_info[file_info_id as usize].extent_size as u64;
-        let extent_id = (n / extent_size + sl.parity) as u16 + 1;   // avoid extent 0 by adding 1
+        let extent_id = (n / extent_size * 2 + sl.parity) as u16 + 1;   // avoid extent 0 by adding 1
         let block_id = (n % extent_size as u64) as u16;
 
         drop(sl);
