@@ -22,7 +22,6 @@ use crate::storage::datastore::FileDesc;
 use crate::block_mgr::block_mgr::BlockMgr;
 use crate::block_mgr::allocator::BlockAllocator;
 use crate::block_mgr::block::BlockLockedMut;
-use crate::block_mgr::block::BlockLocked;
 use crate::block_mgr::block::DataBlock;
 use crate::block_mgr::block::BasicBlock;
 use std::cell::RefCell;
@@ -89,9 +88,9 @@ impl<'a> Iterator<'a> {
         }
     }
 
-    pub fn get_next(&mut self) -> Result<Option<(BlockId, BlockLocked<DataBlock>)>, Error> {
+    pub fn get_next(&mut self) -> Result<Option<(BlockId, DataBlock)>, Error> {
         while let Some(block_id) = self.calc_next_block_id() {
-            let block = self.block_mgr.get_block(&block_id)?;
+            let block = self.block_mgr.get_block_mut_no_lock(&block_id)?;
             if block.get_checkpoint_csn() == self.checkpoint_csn {
                 return Ok(Some((block.get_original_id(), block)));
             } else {

@@ -569,7 +569,22 @@ impl DataStore {
         let extent_size = u16::slice_to_int(&header[22..24])?;
         let max_extent_num = u16::slice_to_int(&header[24..26])?;
         let file_id = u16::slice_to_int(&header[26..28])?;
-        let extent_num = u16::slice_to_int(&header[30..32])?;
+        let extent_num = if file_type == FileType::CheckpointStoreFile {
+
+            // checkpoint store files don't track extent_num in the header
+            let byte_sz = (max_extent_num + 1) / 8;
+            let hdrfilen = block_size - FHBLOCK_HEADER_LEN as u16;
+            let fhe_size =  if byte_sz > hdrfilen {
+                let divizor = block_size - FIBLOCK_HEADER_LEN as u16;
+                (byte_sz - hdrfilen + divizor - 1) / divizor
+            } else {
+                0
+            } + 1;
+            let fhe_size = fhe_size * block_size;
+            ((f.seek(SeekFrom::End(0))? - fhe_size as u64) / extent_size as u64 / block_size as u64) as u16 + 1
+        } else {
+            u16::slice_to_int(&header[30..32])?
+        };
 
         Ok((
             f,
@@ -724,7 +739,6 @@ impl DataStore {
         f.write_all(block.slice())?;
         Ok(())
     }
-
 }
 
 

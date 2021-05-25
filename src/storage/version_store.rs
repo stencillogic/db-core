@@ -166,7 +166,7 @@ impl VersionStore {
     }
 
     /// Free up some spoiled extents for reuse.
-    pub fn reclaim_space(conf: ConfigMt, block_mgr: BlockMgr, retain_timespan: u64, trn_repo: TrnRepo, terminate: Arc<AtomicBool>) {
+    fn reclaim_space(conf: ConfigMt, block_mgr: BlockMgr, retain_timespan: u64, trn_repo: TrnRepo, terminate: Arc<AtomicBool>) {
         let block_allocator = BlockAllocator::new(conf, Rc::new(block_mgr));
         loop {
             if terminate.load(Ordering::Relaxed) {
@@ -360,7 +360,7 @@ impl VersioningStoreEntryAllocator {
 
 /// Repository for tracking version entries on per-transaction basis.
 #[derive(Clone)]
-pub struct TrnRepo {
+struct TrnRepo {
     trn_info:            Arc<Mutex<TrnRepoBody>>,
     earliest_start_time: Arc<AtomicU64>,
 }
@@ -428,3 +428,112 @@ struct TrnRepoBody {
     start_time:     Vec<u64>,
 }
 
+
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::storage::datastore::DataStore;
+    use crate::storage::datastore::FileType;
+    use crate::storage::datastore::FileDesc;
+    use crate::storage::datastore::FileState;
+    use crate::buf_mgr::buf_writer::BufWriter;
+    use crate::system::config::ConfigMt;
+    use std::time::Duration;
+    use std::path::Path;
+
+
+    fn init_datastore(dspath: &str, block_size: usize) -> Vec<FileDesc> {
+
+        if Path::new(&dspath).exists() {
+            std::fs::remove_dir_all(&dspath).expect("Failed to delete test dir on cleanup");
+        }
+        std::fs::create_dir(&dspath).expect("Failed to create test dir");
+
+        let mut fdset = vec![];
+        let desc1 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        3,
+            extent_size:    16,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::DataStoreFile,
+        };
+        let desc2 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        4,
+            extent_size:    10,
+            extent_num:     3,
+            max_extent_num: 65500,
+            file_type:      FileType::VersioningStoreFile,
+        };
+        let desc3 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        5,
+            extent_size:    10,
+            extent_num:     5,
+            max_extent_num: 65500,
+            file_type:      FileType::CheckpointStoreFile,
+        };
+
+        fdset.push(desc1);
+        fdset.push(desc2);
+        fdset.push(desc3);
+
+        DataStore::initialize_datastore(dspath, block_size, &fdset).expect("Failed to init datastore");
+        fdset
+    }
+
+    #[test]
+    fn test_version_store() {
+        let dspath = "/tmp/test_version_store_4546456";
+        let block_size = 8192;
+        let block_num = 100;
+        let writer_num = 2;
+        let retain_timespan = Duration::from_secs(3600);
+        let trn_set_size = 100;
+
+        let mut conf = ConfigMt::new();
+        let mut c = conf.get_conf();
+        c.set_datastore_path(dspath.to_owned());
+        c.set_block_mgr_n_lock(10);
+        c.set_free_info_n_file_lock(10);
+        c.set_free_info_n_extent_lock(10);
+        c.set_block_buf_size(block_num*block_size as u64);
+        c.set_checkpoint_data_threshold(10*1024);
+        c.set_version_retain_time(10_000);
+        c.set_writer_num(2);
+        drop(c);
+
+        let _init_fdesc = init_datastore(dspath, block_size);
+
+        let block_mgr = Rc::new(BlockMgr::new(conf.clone()).expect("Failed to create block mgr"));
+        let block_allocator = Rc::new(BlockAllocator::new(conf.clone(), block_mgr.clone()));
+        let buf_writer = BufWriter::new(&block_mgr, writer_num).expect("Failed to create buf writer");
+
+        let vs = VersionStore::new(conf.clone(), block_mgr.clone(), block_allocator.clone(), retain_timespan, trn_set_size).expect("Failed to create version store");
+
+        let block_id = BlockId::init(3,1,1);
+        let tsn = 123;
+        let entry_sz = 234;
+        let mut block = block_mgr.get_block_mut(&block_id).expect("Failed to get block");
+        let mut entry = block.add_entry(entry_sz);
+        vs.create_version(&block_id, &mut entry, tsn).expect("Failed to create a version");
+
+        let mut cnt = 0;
+        let mut iter = vs.get_iter_for_tran(tsn).expect("Failed to get iterator");
+        while let Some((main_storage_block_id, main_storage_entry_id, block, entry_id)) = iter.get_next().expect("Failed to iterate") {
+            cnt += 1;
+        }
+        assert_eq!(cnt, 1);
+
+        let ss = vs.get_shared_state();
+        let vs2 = VersionStore::from_shared_state(block_mgr.clone(), block_allocator.clone(), ss).expect("Failed to create from shared state");
+        vs.terminate();
+        let vs = vs2;
+
+        vs.finish_tran(tsn);
+        vs.terminate();
+    }
+}

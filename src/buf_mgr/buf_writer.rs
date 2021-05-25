@@ -129,7 +129,7 @@ impl BufWriter {
                 if !desc.checkpoint_written {
                     let mut checkpoint_block = block_mgr.get_block_mut_no_lock(&desc.checkpoint_block_id)?;
                     let checkpoint_csn = checkpoint_block.get_checkpoint_csn();
-                    let actual_block_id = chkpnt_allocators.get_next_block_id(checkpoint_csn, block_mgr);
+                    let actual_block_id = chkpnt_allocators.get_next_block_id(checkpoint_csn, block_mgr)?;
                     checkpoint_block.set_id(actual_block_id);
                     block_mgr.write_block(&mut checkpoint_block)?;
                     block_mgr.set_checkpoint_written(desc.id, true);
@@ -165,7 +165,7 @@ impl CheckpointStoreBlockAllocators {
     }
 
     /// Return next block id for writing block to checkpoint store.
-    pub fn get_next_block_id(&self, checkpoint_csn: u64, block_mgr: &BlockMgr) -> BlockId {
+    pub fn get_next_block_id(&self, checkpoint_csn: u64, block_mgr: &BlockMgr) -> Result<BlockId, Error> {
         let allocator_id = checkpoint_csn as usize & 0x1;
         self.allocators[allocator_id].get_next_block_id(checkpoint_csn, &block_mgr)
     }
@@ -210,7 +210,7 @@ impl CheckpointStoreBlockAllocator {
     }
 
     /// Return next block id for writing block to checkpoint store.
-    pub fn get_next_block_id(&self, checkpoint_csn: u64, block_mgr: &BlockMgr) -> BlockId {
+    pub fn get_next_block_id(&self, checkpoint_csn: u64, block_mgr: &BlockMgr) -> Result<BlockId, Error> {
 
         if self.cur_checkpoint_csn.load(Ordering::Relaxed) != checkpoint_csn {
             self.next_checkpoint(checkpoint_csn, block_mgr);
@@ -219,20 +219,53 @@ impl CheckpointStoreBlockAllocator {
         let sl = self.lock.read().unwrap();
 
         let n = self.seqn.get_next();
-        let file_info_id = (n % sl.file_info.len() as u64) as u16;
-        let file_id = sl.file_info[file_info_id as usize].file_id;
-        let n = n / sl.file_info.len() as u64;
-        let extent_size = sl.file_info[file_info_id as usize].extent_size as u64;
-        let extent_id = (n / extent_size * 2 + sl.parity) as u16 + 1;   // avoid extent 0 by adding 1
-        let block_id = (n % extent_size as u64) as u16;
+        let fid_shift = (n % sl.file_info.len() as u64) as usize;
 
-        drop(sl);
+        let filen = sl.file_info.len();
+        for i in fid_shift..filen+fid_shift {
 
-        BlockId {
-            file_id,
-            extent_id,
-            block_id,
+            let fid = if i >= filen {
+                i - filen
+            } else {
+                i
+            };
+
+            let fi = sl.file_info[fid];
+
+            let file_id = fi.file_id;
+            let n = n / filen as u64;
+            let extent_size = fi.extent_size as u64;
+            let extent_id = (n / extent_size * 2 + sl.parity) as u16 + 1;   // avoid extent 0 by adding 1
+            let block_id = (n % extent_size as u64) as u16;
+            if extent_id >= fi.extent_num {
+                if fi.extent_num == fi.max_extent_num {
+                    continue;
+                } else {
+                    block_mgr.add_extent(file_id)?;
+                    let mut inc = 1;
+                    if extent_id > fi.extent_num {
+                        if fi.extent_num <= fi.max_extent_num - 2 {
+                            block_mgr.add_extent(file_id)?;
+                            inc += 1;
+                        } else {
+                            continue;
+                        }
+                    }
+                    drop(sl);
+                    let mut xl = self.lock.write().unwrap();
+                    xl.file_info[fid].extent_num += inc;
+                    drop(xl);
+                }
+            }
+
+            return Ok(BlockId {
+                file_id,
+                extent_id,
+                block_id,
+            });
         }
+
+        Err(Error::checkpoint_store_size_limit_reached())
     }
 
     // The function is called when new checkpoint is created.
@@ -250,6 +283,7 @@ impl CheckpointStoreBlockAllocator {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -331,7 +365,7 @@ mod tests {
 
         // prepare dirty blocks
         let mut idxs = vec![];
-        for i in 1..3 {
+        for i in 1..16 {
             let block_id = BlockId::init(3,1,i);
             let mut block = block_mgr.get_block_mut(&block_id).expect("Failed to get block for write");
             block.set_checkpoint_csn(1);
@@ -398,7 +432,7 @@ mod tests {
 
         let ds = DataStore::new(conf).expect("Failed to create datastore");
         let stub_pin =  AtomicU64::new(1000);
-        for i in 1..3 {
+        for i in 1..16 {
             let block_id = BlockId::init(3,1,i);
             let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
             let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
@@ -407,7 +441,7 @@ mod tests {
             drop(db);
             drop(ba);
 
-            let block_id = BlockId::init(5,2,i);
+            let block_id = BlockId::init(5, if i<10 {2} else {4}, if i<10 {i} else {i - 10});
             let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
             let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
             assert_eq!(db.get_checkpoint_csn(), 1);
