@@ -11,8 +11,8 @@
 /// Versions older than retain_timespan are discarded, and freed space can be reused.
 /// Each entry in version store also has a pointer to entry in the main data store which is used
 /// during rollback.
-/// Version store represents circular list of extents. With time, oldest and already not 
-/// used extents are removed from the list, and after can be resued by adding at the head of the
+/// Version store represents extendable circular list of extents. With time, oldest and already not 
+/// used extents are removed from the list, and after resued by adding at the head of the
 /// list to accomodate new versioning entries. To free old extents thransactions that run longer
 /// than retain_timespan should be terminated.
 
@@ -20,7 +20,6 @@
 use crate::common::errors::Error;
 use crate::common::defs::BlockId;
 use crate::common::misc::epoch_as_secs;
-use crate::system::config::ConfigMt;
 use crate::block_mgr::block_mgr::BlockMgr;
 use crate::block_mgr::block::DBLOCK_HEADER_LEN;
 use crate::block_mgr::block::VERENTRY_HEADER_LEN;
@@ -29,27 +28,20 @@ use crate::block_mgr::block::DataBlock;
 use crate::block_mgr::block::BasicBlock;
 use crate::block_mgr::block::BlockLockedMut;
 use crate::block_mgr::allocator::BlockAllocator;
-use crate::buf_mgr::buf_mgr::BlockType;
+use crate::storage::datastore::FileDesc;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::thread::JoinHandle;
-use log::error;
 use std::rc::Rc;
 use std::cell::RefCell;
 
 
-const RECLAIM_SLEEP_INTERVAL_MS: u64 = 5000;
-
-
 /// Shared state that can be sent to other threads.
 pub struct VersionStoreSharedState {
-    reclaim_job:        Arc<(JoinHandle<()>, Arc<AtomicBool>)>,
     lock:               Arc<Mutex<AllocatorState>>,
     used_space:         Arc<AtomicUsize>,
     total_free_space:   Arc<usize>,
@@ -61,49 +53,34 @@ pub struct VersionStore {
     block_mgr:          Rc<BlockMgr>,
     entry_allocator:    RefCell<VersioningStoreEntryAllocator>,
     trn_repo:           TrnRepo,
-    reclaim_job:        Arc<(JoinHandle<()>, Arc<AtomicBool>)>,
 }
 
 impl VersionStore {
 
-    pub fn new(conf: ConfigMt, block_mgr: Rc<BlockMgr>, block_allocator: Rc<BlockAllocator>, retain_timespan: Duration, trn_set_size: usize) -> Result<Self, Error> {
+    pub fn new(block_mgr: Rc<BlockMgr>, block_allocator: Rc<BlockAllocator>, _retain_timespan: Duration, trn_set_size: usize) -> Result<Self, Error> {
     
         let entry_allocator = RefCell::new(VersioningStoreEntryAllocator::new(block_mgr.clone(), block_allocator)?);
         let trn_repo = TrnRepo::new(trn_set_size);
-
-        let block_mgr2 = (*block_mgr).clone()?;
-        let trn_repo2 = trn_repo.clone();
-
-        let terminate = Arc::new(AtomicBool::new(false));
-        let terminate2 = terminate.clone();
-
-        let reclaim_job = Arc::new((std::thread::spawn(move || {
-            Self::reclaim_space(conf.clone(),
-                                block_mgr2,
-                                retain_timespan.as_secs(),
-                                trn_repo2,
-                                terminate2);
-        }), terminate));
 
         Ok(VersionStore {
             block_mgr,
             entry_allocator,
             trn_repo,
-            reclaim_job,
         })
     }
 
     /// Build instance from shared state.
     pub fn from_shared_state(block_mgr: Rc<BlockMgr>, block_allocator: Rc<BlockAllocator>, ss: VersionStoreSharedState) -> Result<Self, Error> {
-        let VersionStoreSharedState {reclaim_job, lock, used_space, total_free_space, trn_repo } = ss;
+        let VersionStoreSharedState {lock, used_space, total_free_space, trn_repo } = ss;
         
         let entry_allocator = RefCell::new(VersioningStoreEntryAllocator::from_shared_state(block_mgr.clone(), block_allocator, lock, used_space, total_free_space)?);
+        let cur_block_id = entry_allocator.borrow().calc_next_block_id(&trn_repo)?;
+        entry_allocator.borrow_mut().cur_block_id = cur_block_id;
 
         Ok(VersionStore {
             block_mgr,
             entry_allocator,
             trn_repo,
-            reclaim_job,
         })
     }
 
@@ -111,7 +88,6 @@ impl VersionStore {
     pub fn get_shared_state(&self) -> VersionStoreSharedState {
         let (lock, used_space, total_free_space) = self.entry_allocator.borrow().get_shared_state();
         VersionStoreSharedState {
-            reclaim_job:        self.reclaim_job.clone(),
             lock:               lock,
             used_space:         used_space,
             total_free_space:   total_free_space,
@@ -125,7 +101,7 @@ impl VersionStore {
     pub fn create_version(&self, block_id: &BlockId, entry: &mut DataBlockEntryMut, tsn: u64) -> Result<(), Error> {
         let mut entry_allocator = self.entry_allocator.borrow_mut();
         let ver_entry_sz = VERENTRY_HEADER_LEN + entry.size() as usize;
-        let mut ver_block = entry_allocator.get_next_entry_block(ver_entry_sz)?;
+        let mut ver_block = entry_allocator.get_next_entry_block(ver_entry_sz, &self.trn_repo)?;
 
         let ver_block_id = ver_block.get_id();
         let mut ver_entry = ver_block.add_version_entry(ver_entry_sz);
@@ -164,31 +140,6 @@ impl VersionStore {
     pub fn finish_tran(&self, tsn: u64) {
         self.trn_repo.rm_tran(tsn);
     }
-
-    /// Free up some spoiled extents for reuse.
-    fn reclaim_space(conf: ConfigMt, block_mgr: BlockMgr, retain_timespan: u64, trn_repo: TrnRepo, terminate: Arc<AtomicBool>) {
-        let block_allocator = BlockAllocator::new(conf, Rc::new(block_mgr));
-        loop {
-            if terminate.load(Ordering::Relaxed) {
-                break;
-            }
-
-            std::thread::sleep(Duration::from_millis(RECLAIM_SLEEP_INTERVAL_MS));
-
-            let last_change_date = std::cmp::min(epoch_as_secs() - retain_timespan, trn_repo.get_earliest_start_time());
-println!("lcd {}", last_change_date);
-            if let Err(e) = block_allocator.free_versioning_extents(last_change_date) {
-                error!("Failed to reclaim version store space: {}", e);
-            }
-        }
-    }
-
-    pub fn terminate(self) {
-        if let Ok((jh, terminate)) = Arc::try_unwrap(self.reclaim_job) {
-            terminate.store(true, Ordering::Relaxed);
-            jh.join().unwrap();
-        }
-    }
 }
 
 
@@ -209,7 +160,7 @@ impl<'a> Iterator<'a> {
         {
             Ok(None)
         } else {
-            let block = self.version_store.block_mgr.get_block_mut(&self.last_ver_block_id)?;
+            let block = self.version_store.block_mgr.get_versioning_block_mut(&self.last_ver_block_id)?;
             let entry = block.get_version_entry(self.last_ver_entry_id)?;
 
             let (last_ver_block_id, last_ver_entry_id) = entry.get_prev_created_entry_ptr();
@@ -228,8 +179,9 @@ impl<'a> Iterator<'a> {
 
 /// Shared state of version store allocator.
 struct AllocatorState {
-    block_id:       BlockId,
-    extent_size:    u16,
+    tail_extent:        (u16, u16, u16),
+    block_id:           BlockId,
+    extent_size:        u16,
 }
 
 
@@ -247,18 +199,17 @@ struct VersioningStoreEntryAllocator {
 impl VersioningStoreEntryAllocator {
 
     pub fn new(block_mgr: Rc<BlockMgr>, block_allocator: Rc<BlockAllocator>) -> Result<VersioningStoreEntryAllocator, Error> {
-        let (file_id, extent_id, extent_size) = block_allocator.get_free_versioning_extent()?;
-        let block_id = BlockId {
-            file_id,
-            extent_id,
-            block_id: block_mgr.calc_extent_fi_block_num(extent_size as usize) as u16 + 1,
-        };
+        let mut file_desc_buf = RefCell::new(vec![]);
+        let (file_id, extent_id, extent_size) = Self::get_versioning_extent(&block_mgr, &mut file_desc_buf)?;
+println!("got esz {}", extent_size);
+        let block_id = BlockId::init(file_id, extent_id, 1);
 
         let used_space          = Arc::new(AtomicUsize::new(2 + DBLOCK_HEADER_LEN));
         let total_free_space    = Arc::new(block_mgr.get_block_size());
         let cur_block_id        = block_id;
 
         let allocator_state = AllocatorState {
+            tail_extent: (0, 0, 0),
             block_id,
             extent_size,
         };
@@ -285,18 +236,14 @@ impl VersioningStoreEntryAllocator {
         total_free_space:   Arc<usize>) -> Result<Self, Error> 
     {
         let cur_block_id = BlockId::new(); 
-        let mut ret = VersioningStoreEntryAllocator {
+        Ok(VersioningStoreEntryAllocator {
             block_mgr,
             block_allocator,
             lock, 
             used_space,
             total_free_space,
             cur_block_id,
-        };
-
-        ret.cur_block_id = ret.calc_next_block_id()?;
-
-        Ok(ret)
+        })
     }
 
     /// Return shared state that can be sent to other threads.
@@ -305,47 +252,63 @@ impl VersioningStoreEntryAllocator {
     }
 
     /// Return a block for the entry to be placed in.
-    pub fn get_next_entry_block(&mut self, entry_size: usize) -> Result<DataBlock, Error> {
+    pub fn get_next_entry_block(&mut self, entry_size: usize, trn_repo: &TrnRepo) -> Result<BlockLockedMut<DataBlock>, Error> {
         // try to reserve space for the entry in the current block;
         // if not enough space left then calculate next versioning store block id,
         // get a free block from buffer, set block_id, and add entry to the block,
         // set block as current;
         // return entry.
 
-        let block = self.block_mgr.get_block_mut_no_lock(&self.cur_block_id)?;
+        let block = self.block_mgr.get_versioning_block_mut(&self.cur_block_id)?;
         if block.get_free_space() >= entry_size {
+println!("ver block: {:?}", self.cur_block_id);
             return Ok(block);
         } else {
-            self.cur_block_id = self.calc_next_block_id()?;
-            self.block_mgr.allocate_on_cache_mut_no_lock(self.cur_block_id, BlockType::VersionBlock)
+            self.block_mgr.set_dirty(block.get_buf_idx(), true);
+            self.cur_block_id = self.calc_next_block_id(trn_repo)?;
+println!("ver block add: {:?}", self.cur_block_id);
+            self.block_mgr.get_versioning_block_mut(&self.cur_block_id)
         }
     }
 
-    fn calc_next_block_id(&self) -> Result<BlockId, Error> {
+    fn calc_next_block_id(&self, trn_repo: &TrnRepo) -> Result<BlockId, Error> {
         let mut lock = self.lock.lock().unwrap();
         let AllocatorState {
+            tail_extent,
             mut block_id,
             extent_size,
         } = *lock;
         block_id.block_id += 1;
         if block_id.block_id == extent_size {
+            // get oldest extent
+            let (file_id, extent_id, extent_size) = tail_extent;
 
-            // set last use timestamp and mark extent as full.
-            let ehb_id = BlockId {
-                file_id:    block_id.file_id,
-                extent_id:  block_id.extent_id,
-                block_id:   0,
+            let (file_id, extent_id, extent_size) = if extent_size > 0 {
+                let mut tail_ehb = self.block_mgr.get_extent_header_block_mut_no_lock(&BlockId::init(file_id, extent_id, 0))?;
+                if trn_repo.get_earliest_start_time() > tail_ehb.get_seal_date() {
+
+                    tail_ehb.set_seal_date(u64::MAX);
+                    let (tail_file_id, tail_extent_id) = tail_ehb.get_next_versioning_extent();
+                    let desc = self.block_mgr.get_file_desc(tail_file_id).ok_or(Error::file_does_not_exist())?;
+                    lock.tail_extent =(tail_file_id, tail_extent_id, desc.extent_size);
+
+                    (file_id, extent_id, extent_size)
+                } else {
+                    self.block_allocator.allocate_versioning_extent()?
+                }
+            } else {
+                self.block_allocator.allocate_versioning_extent()?
             };
-            let mut ehb = self.block_mgr.get_extent_header_block_mut(&ehb_id)?;
-            ehb.set_last_change_date(epoch_as_secs());
 
-            self.block_allocator.mark_extent_full(block_id.file_id, block_id.extent_id)?;
+            // set last used time and next extent for the current extent
+            let mut ehb = self.block_mgr.get_extent_header_block_mut_no_lock(&BlockId::init(block_id.file_id, block_id.extent_id, 0))?;
+            ehb.set_seal_date(epoch_as_secs());
+            ehb.set_next_versioning_extent(file_id, extent_id);
+            self.block_mgr.set_dirty(ehb.get_buf_idx(), true);
 
-            // get next free extent.
-            let (file_id, extent_id, _extent_size) = self.block_allocator.get_free_versioning_extent()?;
             block_id.file_id = file_id;
             block_id.extent_id = extent_id;
-            block_id.block_id = 0;
+            block_id.block_id = 1;
             lock.extent_size = extent_size;
         }
 
@@ -353,6 +316,15 @@ impl VersioningStoreEntryAllocator {
         lock.block_id = block_id;
 
         Ok(block_id)
+    }
+
+    fn get_versioning_extent(block_mgr: &BlockMgr, file_desc_buf: &mut RefCell<Vec<FileDesc>>) -> Result<(u16, u16, u16), Error> {
+        block_mgr.get_versioning_files(&mut file_desc_buf.borrow_mut());
+        let file_desc_set = &file_desc_buf.borrow();
+        for desc in file_desc_set.iter() {
+            return Ok((desc.file_id, 1, desc.extent_size));
+        }
+        return Err(Error::db_size_limit_reached())
     }
 }
 
@@ -438,7 +410,6 @@ mod tests {
     use crate::storage::datastore::FileType;
     use crate::storage::datastore::FileDesc;
     use crate::storage::datastore::FileState;
-    use crate::buf_mgr::buf_writer::BufWriter;
     use crate::system::config::ConfigMt;
     use std::time::Duration;
     use std::path::Path;
@@ -464,7 +435,7 @@ mod tests {
             state:          FileState::InUse,
             file_id:        4,
             extent_size:    10,
-            extent_num:     3,
+            extent_num:     2,
             max_extent_num: 65500,
             file_type:      FileType::VersioningStoreFile,
         };
@@ -490,11 +461,10 @@ mod tests {
         let dspath = "/tmp/test_version_store_4546456";
         let block_size = 8192;
         let block_num = 100;
-        let writer_num = 2;
         let retain_timespan = Duration::from_secs(3600);
         let trn_set_size = 100;
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.to_owned());
         c.set_block_mgr_n_lock(10);
@@ -510,30 +480,68 @@ mod tests {
 
         let block_mgr = Rc::new(BlockMgr::new(conf.clone()).expect("Failed to create block mgr"));
         let block_allocator = Rc::new(BlockAllocator::new(conf.clone(), block_mgr.clone()));
-        let buf_writer = BufWriter::new(&block_mgr, writer_num).expect("Failed to create buf writer");
 
-        let vs = VersionStore::new(conf.clone(), block_mgr.clone(), block_allocator.clone(), retain_timespan, trn_set_size).expect("Failed to create version store");
+        let vs = VersionStore::new(block_mgr.clone(), block_allocator.clone(), retain_timespan, trn_set_size).expect("Failed to create version store");
+
+
+        // two transactions create several versons 
 
         let block_id = BlockId::init(3,1,1);
         let tsn = 123;
-        let entry_sz = 234;
+        let entry_sz = 47;
+        let vcnt = 6;
         let mut block = block_mgr.get_block_mut(&block_id).expect("Failed to get block");
-        let mut entry = block.add_entry(entry_sz);
-        vs.create_version(&block_id, &mut entry, tsn).expect("Failed to create a version");
-
-        let mut cnt = 0;
-        let mut iter = vs.get_iter_for_tran(tsn).expect("Failed to get iterator");
-        while let Some((main_storage_block_id, main_storage_entry_id, block, entry_id)) = iter.get_next().expect("Failed to iterate") {
-            cnt += 1;
+        for i in 0..vcnt {
+            let mut entry = block.add_entry(entry_sz + i);
+            entry.mut_slice(0,1)[0] = (vcnt + i) as u8;
+            vs.create_version(&block_id, &mut entry, tsn + i as u64 % 2).expect("Failed to create a version");
         }
-        assert_eq!(cnt, 1);
 
+        for t in 0..2 {
+            let mut cnt = 0;
+            let mut iter = vs.get_iter_for_tran(tsn + t as u64).expect("Failed to get iterator");
+            while let Some((_main_storage_block_id, _main_storage_entry_id, mut block, entry_id)) = iter.get_next().expect("Failed to iterate") {
+                let mut ventry = block.get_version_entry_mut(entry_id).expect("Failed to get entry");
+                let mut entry = ventry.inner_entry();
+                let i = vcnt - cnt - 2 + t;
+                assert_eq!(entry.size() as usize, entry_sz + i);
+                let slice = entry.mut_slice(0, 2);
+                assert_eq!(slice[0] as usize, vcnt + i);
+                cnt += 2;
+            }
+            assert_eq!(cnt, vcnt);
+        }
+
+
+        // recreating version store from shared state
+        
+        
         let ss = vs.get_shared_state();
         let vs2 = VersionStore::from_shared_state(block_mgr.clone(), block_allocator.clone(), ss).expect("Failed to create from shared state");
-        vs.terminate();
-        let vs = vs2;
 
+
+        // finalize transaction
+
+
+        assert!(vs2.get_iter_for_tran(tsn).unwrap().get_next().unwrap().is_some());
+        assert!(vs.get_iter_for_tran(tsn).unwrap().get_next().unwrap().is_some());
         vs.finish_tran(tsn);
-        vs.terminate();
+        assert!(vs2.get_iter_for_tran(tsn).unwrap().get_next().unwrap().is_none());
+        assert!(vs.get_iter_for_tran(tsn).unwrap().get_next().unwrap().is_none());
+        vs2.finish_tran(tsn + 1);
+
+
+        // test allocation
+
+        
+        let block_id = BlockId::init(3,1,5);
+        let tsn = 125;
+        let entry_sz = block_size / 4;
+        let mut block = block_mgr.get_block_mut(&block_id).expect("Failed to get block");
+        let mut entry = block.add_entry(entry_sz);
+        for _ in 0..32 {
+            vs.create_version(&block_id, &mut entry, tsn).expect("Failed to create a version");
+            vs.finish_tran(tsn);
+        }
     }
 }

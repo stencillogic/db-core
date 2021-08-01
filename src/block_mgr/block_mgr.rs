@@ -63,53 +63,74 @@ impl BlockMgr {
 
     /// Lock for reading and return data block.
     pub fn get_block(&self, block_id: &BlockId) -> Result<BlockLocked<DataBlock>, Error> {
-        self.get_block_for_read::<DataBlock>(block_id, DataBlock::new)
+        self.get_block_for_read::<DataBlock>(block_id, DataBlock::new, 0)
+    }
+
+    /// Lock for reading and return data block.
+    pub fn get_versioning_block(&self, block_id: &BlockId) -> Result<BlockLocked<DataBlock>, Error> {
+        self.get_block_for_read::<DataBlock>(block_id, DataBlock::new, 1)
     }
 
     /// Lock for reading and return file-level header block.
     pub fn get_file_header_block(&self, block_id: &BlockId) -> Result<BlockLocked<FileHeaderBlock>, Error> {
-        self.get_block_for_read::<FileHeaderBlock>(block_id, FileHeaderBlock::new)
+        self.get_block_for_read::<FileHeaderBlock>(block_id, FileHeaderBlock::new, 0)
     }
 
     /// Lock for reading and return extent-level header block.
     pub fn get_extent_header_block(&self, block_id: &BlockId) -> Result<BlockLocked<ExtentHeaderBlock>, Error> {
-        self.get_block_for_read::<ExtentHeaderBlock>(block_id, ExtentHeaderBlock::new)
+        self.get_block_for_read::<ExtentHeaderBlock>(block_id, ExtentHeaderBlock::new, 0)
     }
 
     /// Lock for reading and return a block containing free info bitmap section which didn't fint
     /// into header block.
     pub fn get_free_info_block(&self, block_id: &BlockId) -> Result<BlockLocked<FreeInfoBlock>, Error> {
-        self.get_block_for_read::<FreeInfoBlock>(block_id, FreeInfoBlock::new)
+        self.get_block_for_read::<FreeInfoBlock>(block_id, FreeInfoBlock::new, 0)
     }
 
 
     /// Lock for writing and return data block.
     pub fn get_block_mut(&self, block_id: &BlockId) -> Result<BlockLockedMut<DataBlock>, Error> {
-        self.get_block_for_write::<DataBlock>(block_id, DataBlock::new, false)
+        self.get_block_for_write::<DataBlock>(block_id, DataBlock::new, false, 0)
+    }
+
+    /// Lock for writing and return data block.
+    pub fn get_versioning_block_mut(&self, block_id: &BlockId) -> Result<BlockLockedMut<DataBlock>, Error> {
+        self.get_block_for_write::<DataBlock>(block_id, DataBlock::new, false, 1)
     }
 
     /// Lock for writing and return file-level header block.
     pub fn get_file_header_block_mut(&self, block_id: &BlockId) -> Result<BlockLockedMut<FileHeaderBlock>, Error> {
-        self.get_block_for_write::<FileHeaderBlock>(block_id, FileHeaderBlock::new, false)
+        self.get_block_for_write::<FileHeaderBlock>(block_id, FileHeaderBlock::new, false, 0)
     }
 
     /// Lock for writing and return extent-level header block.
     pub fn get_extent_header_block_mut(&self, block_id: &BlockId) -> Result<BlockLockedMut<ExtentHeaderBlock>, Error> {
-        self.get_block_for_write::<ExtentHeaderBlock>(block_id, ExtentHeaderBlock::new, false)
+        self.get_block_for_write::<ExtentHeaderBlock>(block_id, ExtentHeaderBlock::new, false, 0)
     }
 
     /// Lock for writing and return a block containing free info bitmap section which didn't fint
     /// into header block.
     pub fn get_free_info_block_mut(&self, block_id: &BlockId) -> Result<BlockLockedMut<FreeInfoBlock>, Error> {
-        self.get_block_for_write::<FreeInfoBlock>(block_id, FreeInfoBlock::new, false)
+        self.get_block_for_write::<FreeInfoBlock>(block_id, FreeInfoBlock::new, false, 0)
+    }
+
+
+    /// Return data block pinned, but not locked, dirty flag is not changed.
+    pub fn get_block_mut_no_lock(&self, block_id: &BlockId) -> Result<DataBlock, Error> {
+        self.get_block_for_write_no_lock::<DataBlock>(block_id, DataBlock::new)
+    }
+
+    /// Return extent header block pinned, but not locked, dirty flag is not changed.
+    pub fn get_extent_header_block_mut_no_lock(&self, block_id: &BlockId) -> Result<ExtentHeaderBlock, Error> {
+        self.get_block_for_write_no_lock::<ExtentHeaderBlock>(block_id, ExtentHeaderBlock::new)
     }
 
 
     // lock and return block of type T
-    fn get_block_for_read<'b, T>(&'b self, block_id: &BlockId, init_fun: fn(BlockId, usize, Pinned<'b, BlockArea>) -> T) -> Result<BlockLocked<T>, Error> 
+    fn get_block_for_read<'b, T>(&'b self, block_id: &BlockId, init_fun: fn(BlockId, usize, Pinned<'b, BlockArea>) -> T, lock_type: usize) -> Result<BlockLocked<T>, Error> 
         where T: BasicBlock
     {
-        let lid = block_id.hash(self.locks.len());
+        let lid = block_id.hash(self.locks.len()/2)*2 + lock_type;
         let lock_holder = RwLockGuard::Read(self.locks[lid].read().unwrap());
 
         if let Some((data, buf_idx)) = self.buf_mgr.get_block(&block_id) {
@@ -127,41 +148,17 @@ impl BlockMgr {
         }
     }
 
-    // lock and return block of type T suitable for modification;
-    // if try_lock is true then first try locking, Error will be returned if block is blocked.
-    pub fn get_block_mut_no_lock(&self, block_id: &BlockId) -> Result<DataBlock, Error> {
-
-        if let Some((data, buf_idx)) = self.buf_mgr.get_block(&block_id) {
-            self.set_dirty(buf_idx, true);
-            Ok(DataBlock::new(*block_id, buf_idx, data))
-        } else {
-            let block_type = self.determine_block_type(&block_id);
-            let ds_data = self.ds.load_block(&block_id, FileState::InUse)?;
-            let (mut data, buf_idx) = self.allocate_on_cache(*block_id, block_type);
-            data.copy_from_slice(&ds_data);
-
-            self.set_dirty(buf_idx, true);
-
-            Ok(DataBlock::new(*block_id, buf_idx, data))
-        }
-    }
-
-    fn determine_block_type(&self, block_id: &BlockId) -> BlockType {
-        let file_desc = self.ds.get_file_desc(block_id.file_id).unwrap();
-        match file_desc.file_type {
-            FileType::DataStoreFile => BlockType::DataBlock,
-            FileType::CheckpointStoreFile => BlockType::CheckpointBlock,
-            FileType::VersioningStoreFile => BlockType::VersionBlock,
-        }
+    pub fn get_file_desc(&self, file_id: u16) -> Option<FileDesc> {
+        self.ds.get_file_desc(file_id)
     }
 
 
     // lock and return block of type T suitable for modification;
     // if try_lock is true then first try locking, Error will be returned if block is blocked.
-    pub fn get_block_for_write<'b, T>(&'b self, block_id: &BlockId, init_fun: fn(BlockId, usize, Pinned<'b, BlockArea>) -> T, try_lock: bool) -> Result<BlockLockedMut<T>, Error>
+    pub fn get_block_for_write<'b, T>(&'b self, block_id: &BlockId, init_fun: fn(BlockId, usize, Pinned<'b, BlockArea>) -> T, try_lock: bool, lock_type: usize) -> Result<BlockLockedMut<T>, Error>
         where T: BasicBlock
     {
-        let lid = block_id.hash(self.locks.len());
+        let lid = block_id.hash(self.locks.len()/2)*2 + lock_type;
         let lock_holder = if try_lock {
             RwLockGuard::Write(self.locks[lid].try_write().map_err(|_| Error::try_lock_error())?)
         } else {
@@ -191,6 +188,28 @@ impl BlockMgr {
         }
     }
 
+    fn get_block_for_write_no_lock<'b, T>(&'b self, block_id: &BlockId, init_fun: fn(BlockId, usize, Pinned<'b, BlockArea>) -> T) -> Result<T, Error> {
+        if let Some((data, buf_idx)) = self.buf_mgr.get_block(&block_id) {
+            Ok(init_fun(*block_id, buf_idx, data))
+        } else {
+            let block_type = self.determine_block_type(&block_id);
+            let ds_data = self.ds.load_block(&block_id, FileState::InUse)?;
+            let (mut data, buf_idx) = self.allocate_on_cache(*block_id, block_type);
+            data.copy_from_slice(&ds_data);
+
+            Ok(init_fun(*block_id, buf_idx, data))
+        }
+    }
+
+    fn determine_block_type(&self, block_id: &BlockId) -> BlockType {
+        let file_desc = self.ds.get_file_desc(block_id.file_id).unwrap();
+        match file_desc.file_type {
+            FileType::DataStoreFile => BlockType::DataBlock,
+            FileType::CheckpointStoreFile => BlockType::CheckpointBlock,
+            FileType::VersioningStoreFile => BlockType::VersionBlock,
+        }
+    }
+
     pub fn block_fill_size(&self) -> usize {
         self.ds.block_fill_size()
     }
@@ -201,9 +220,9 @@ impl BlockMgr {
     }
 
     /// Return block from buffer by index.
-    pub fn get_block_by_idx(&self, id: usize) -> Option<BlockLockedMut<DataBlock>> {
+    pub fn get_block_by_idx(&self, id: usize, block_id: BlockId, block_type: BlockType) -> Option<BlockLockedMut<DataBlock>> {
 
-        let lid = id % self.locks.len();
+        let lid = block_id.hash(self.locks.len()/2)*2 + if block_type == BlockType::VersionBlock {1} else {0};
 
         let lock_holder = RwLockGuard::Write(self.locks[lid].write().unwrap());
         if let Some(data) = self.buf_mgr.get_block_by_idx(id) {
@@ -230,10 +249,10 @@ impl BlockMgr {
         }
     }
 
-    /// take a free block from the buffer, assign the specified block_id, for it and return.
+    /// Take a free block from the buffer, assign the specified block_id, for it and return. Dirty
+    /// flag is not changed.
     pub fn allocate_on_cache_mut_no_lock(&self, block_id: BlockId, block_type: BlockType) -> Result<DataBlock, Error> {
         let (mut data, buf_idx) = self.allocate_on_cache(block_id, block_type);
-        self.set_dirty(buf_idx, true);
         for b in data.deref_mut().deref_mut() {*b = 0;};
         Ok(DataBlock::new(block_id, buf_idx, data))
     }
@@ -425,7 +444,7 @@ mod tests {
         block4.fi_slice_mut()[0] = someval;
         drop(block4);
 
-        let block5 = block_mgr.get_block_for_write(&block_id5, DataBlock::new, false).expect("failed to get block");
+        let block5 = block_mgr.get_block_for_write(&block_id5, DataBlock::new, false, 0).expect("failed to get block");
         drop(block5);
 
 
@@ -451,7 +470,8 @@ mod tests {
         let mut block_iter = block_mgr.get_iter();
         while let Some(desc) = block_iter.next() { }
         for i in 0..block_num as usize {
-            assert!(block_mgr.get_block_by_idx(i).is_some());
+            let desc = block_mgr.get_block_desc(i).unwrap();
+            assert!(block_mgr.get_block_by_idx(desc.id, desc.block_id, desc.block_type).is_some());
         }
 
         let mut block1 = block_mgr.get_block_mut(&block_id1).expect("failed to get block");

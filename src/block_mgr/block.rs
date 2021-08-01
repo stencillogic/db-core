@@ -816,16 +816,18 @@ impl FreeInfoHeaderSection for FileHeaderBlock<'_> {
 
 
 /// Extent header block.
-///     crc             - u32: header block crc
-///     checkpoint_csn  - u64: checkpoint csn
-///     original_id     - 3 x u16: in checkpoint blocks points to the original block id.
-///     use_mark        - u8: 1 - file is initialized and is in use, 0 - otherwise.
-///     last_update_ts  - u64: unix epoch seconds of last extent access. Only used in versioning
-///                       store extents.
-///     fi_full_cnt     - u16: number of full blocks in the extent (number of set bits in free_info)
-///     fi_length       - u16: number of bits in free_blocks bitmask (equals to extent size)
-///     free_info       - bitmask containing about extents with free blocks: 0 - extent has free
-///                       blocks, 1 - extent is full.
+///     crc                         - u32: header block crc
+///     checkpoint_csn              - u64: checkpoint csn
+///     original_id                 - 3 x u16: in checkpoint blocks points to the original block id.
+///     use_mark                    - u8: 1 - file is initialized and is in use, 0 - otherwise.
+///     last_update_ts              - u64: unix epoch seconds of extent sealing. Only used in versioning
+///                                     store extents.
+///     fi_full_cnt (next_file_id)  - u16: number of full blocks in the extent (pointer to next versioning
+///                                     extent)
+///     fi_length (next_extent_id)  - u16: number of bits in free_blocks bitmask (pointer to next 
+///                                     versioning extent)
+///     free_info                   - bitmask containing about extents with free blocks: 0 - extent has free
+///                                     blocks, 1 - extent is full.
 pub struct ExtentHeaderBlock<'a> {
     id:             BlockId,
     buf_idx:        usize,
@@ -842,14 +844,26 @@ impl<'a> ExtentHeaderBlock<'a> {
         }
     }
 
-    // return number of full blocks
-    pub fn get_last_change_date(&self) -> u64 {
+    // return sealing timestamp 
+    pub fn get_seal_date(&self) -> u64 {
         u64::slice_to_int(&self.data[19..27]).unwrap()
     }
 
-    // return number of full blocks
-    pub fn set_last_change_date(&mut self, ts: u64) {
+    // set sealing timestamp 
+    pub fn set_seal_date(&mut self, ts: u64) {
         self.data[19..27].copy_from_slice(&ts.to_ne_bytes());
+    }
+
+    // return pointer to next versioning extent
+    pub fn get_next_versioning_extent(&self) -> (u16, u16) {
+        (u16::slice_to_int(&self.data[27..29]).unwrap(),
+         u16::slice_to_int(&self.data[29..31]).unwrap())
+    }
+
+    // set pointer to next versioning extent
+    pub fn set_next_versioning_extent(&mut self, file_id: u16, extent_id: u16) {
+        self.data[27..29].copy_from_slice(&file_id.to_ne_bytes());
+        self.data[29..31].copy_from_slice(&extent_id.to_ne_bytes());
     }
 }
 
@@ -1375,10 +1389,10 @@ mod tests {
 
         // block-specific functions
         let mut ts = 0;
-        assert_eq!(block.get_last_change_date(), ts);
+        assert_eq!(block.get_seal_date(), ts);
         ts = 4234;
-        block.set_last_change_date(ts);
-        assert_eq!(block.get_last_change_date(), ts);
+        block.set_seal_date(ts);
+        assert_eq!(block.get_seal_date(), ts);
 
         // basic block functions
         assert_eq!(buf_idx, block.get_buf_idx());

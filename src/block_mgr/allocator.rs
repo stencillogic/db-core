@@ -89,44 +89,9 @@ impl BlockAllocator {
         }
     }
 
-    /// Return file_id, extent_id, and extent_size of a new extent from the versioning store.
-    pub fn get_free_versioning_extent(&self) -> Result<(u16, u16, u16), Error> {
-        if let Some(extent) = self.find_free_versioning_extent()? {
-            Ok(extent)
-        } else {
-            self.allocate_versioning_extent()
-        }
-    }
-
     /// mark an extent as full.
     pub fn mark_extent_full(&self, file_id: u16, extent_id: u16) -> Result<(), Error> {
         self.free_info.set_extent_bit(file_id, extent_id, true)
-    }
-
-    /// free versioning extents marked as used and with last change date older that speicified.
-    pub fn free_versioning_extents(&self, last_change_date: u64) -> Result<(), Error> {
-        // it would be better to use linked list of extents to avoid excessive scans.
-        // so that extents are linked in order of time, and oldest residing in the tails 
-        // must be checked in the first place.
-        self.block_mgr.get_versioning_files(&mut self.file_desc_buf.borrow_mut());
-        let file_desc_set = &self.file_desc_buf.borrow();
-        for desc in file_desc_set.iter() {
-            self.free_info.get_fi_for_file(desc.file_id, &mut self.file_fi_data.borrow_mut())?;
-            let file_fi_data = self.file_fi_data.borrow();
-            let mut used_iter = file_fi_data.used_iter();
-            while let Some(extent_id) = used_iter.next() {
-                let block_id = BlockId {
-                    file_id: desc.file_id,
-                    extent_id,
-                    block_id: 0,
-                };
-                let ehb = self.block_mgr.get_extent_header_block(&block_id)?;
-                if last_change_date > ehb.get_last_change_date() {
-                    self.free_info.set_extent_bit(desc.file_id, extent_id, false)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// In some of datastore files add a new extent, return first free block from that extent.
@@ -172,10 +137,23 @@ impl BlockAllocator {
     /// Return free data block from checkpoint store.
     pub fn get_free_checkpoint_block(&self, checkpoint_csn: u64) -> Result<DataBlock, Error> {
         // determine next available block_id;
-        // lock mutably a free block from buffer and assign it to block_id;
-        // return the locked block.
+        // find a free block from buffer and assign it to block_id;
+        // return the block.
         let block_id = self.get_next_checkpoint_block_id(checkpoint_csn);
         self.block_mgr.allocate_on_cache_mut_no_lock(block_id, BlockType::CheckpointBlock)
+    }
+
+    /// Allocate extent in the versioning store.
+    pub fn allocate_versioning_extent(&self) -> Result<(u16, u16, u16), Error> {
+        self.block_mgr.get_versioning_files(&mut self.file_desc_buf.borrow_mut());
+        let file_desc_set = &self.file_desc_buf.borrow();
+        for desc in file_desc_set.iter() {
+            if desc.extent_num < desc.max_extent_num {
+                self.block_mgr.add_extent(desc.file_id)?;
+                return Ok((desc.file_id, desc.extent_num, desc.extent_size));
+            }
+        }
+        return Err(Error::db_size_limit_reached());
     }
 
     // return next generated checkpoint block_id.
@@ -194,38 +172,6 @@ impl BlockAllocator {
             block_id,
         }
     }
-
-    // find and return file_id and extent_id from versinoning store.
-    fn find_free_versioning_extent(&self) -> Result<Option<(u16, u16, u16)>, Error> {
-        self.block_mgr.get_versioning_files(&mut self.file_desc_buf.borrow_mut());
-        let file_desc_set = &self.file_desc_buf.borrow();
-        for desc in file_desc_set.iter() {
-            self.free_info.get_fi_for_file(desc.file_id, &mut self.file_fi_data.borrow_mut())?;
-            let file_fi_data = self.file_fi_data.borrow();
-            let mut free_iter = file_fi_data.free_iter();
-            while let Some(extent_id) = free_iter.next() {
-                return Ok(Some((desc.file_id, extent_id, desc.extent_size)));
-            }
-        }
-        Ok(None)
-    }
-
-    // allocate an extent in the versioning store.
-    fn allocate_versioning_extent(&self) -> Result<(u16, u16, u16), Error> {
-        self.block_mgr.get_versioning_files(&mut self.file_desc_buf.borrow_mut());
-        let file_desc_set = &self.file_desc_buf.borrow();
-        for desc in file_desc_set.iter() {
-            self.free_info.get_fi_for_file(desc.file_id, &mut self.file_fi_data.borrow_mut())?;
-            if self.file_fi_data.borrow().size() < desc.max_extent_num {
-                self.block_mgr.add_extent(desc.file_id)?;
-                self.free_info.add_extent(desc.file_id)?;
-                let extent_id = self.file_fi_data.borrow().size();
-                return Ok((desc.file_id, extent_id, desc.extent_size));
-            }
-        }
-        return Err(Error::db_size_limit_reached());
-    }
-
 
     // find and return block with free space.
     fn find_free_block(&self) -> Result<Option<BlockLockedMut<DataBlock>>, Error> {
@@ -264,7 +210,7 @@ impl BlockAllocator {
                 block_id,
             };
 
-            match self.block_mgr.get_block_for_write::<DataBlock>(&blid, DataBlock::new, true) {
+            match self.block_mgr.get_block_for_write::<DataBlock>(&blid, DataBlock::new, true, 0) {
                 Ok(block) => {
                     if block.get_used_space() < self.block_mgr.block_fill_size() {
                         return Ok(Some(block));
@@ -371,17 +317,6 @@ mod tests {
         assert_eq!(block_id, block.get_id());
         drop(block);
 
-
-        let ret = ba.get_free_versioning_extent().unwrap();
-        assert_eq!((4, 1, 10), ret);
-
-        ba.mark_extent_full(4, 1).expect("Failed to mark extent full");
-        let ret = ba.get_free_versioning_extent().unwrap();
-        assert_eq!((4, 2, 10), ret);
-
-        ba.free_versioning_extents(1).expect("Failed to free versioning extents");
-        let ret = ba.get_free_versioning_extent().unwrap();
-        assert_eq!((4, 1, 10), ret);
 
         let block_id = BlockId::init(3, 3, 1);
         let block = ba.allocate_block().expect("Failed to allocate block");

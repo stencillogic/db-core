@@ -71,7 +71,7 @@ impl<'b> BlockStorageDriver {
 
         let block_allocator = Rc::new(BlockAllocator::new(conf.clone(), block_mgr.clone()));
 
-        let version_store = VersionStore::new(conf.clone(), block_mgr.clone(), block_allocator.clone(), Duration::from_secs(version_retain_time as u64), tran_num as usize)?;
+        let version_store = VersionStore::new(block_mgr.clone(), block_allocator.clone(), Duration::from_secs(version_retain_time as u64), tran_num as usize)?;
         let checkpoint_store = CheckpointStore::new(block_mgr.clone(), block_allocator.clone())?;
 
         let buf_writer = BufWriter::new(&block_mgr, writer_num as usize)?;
@@ -428,7 +428,7 @@ impl<'b> BlockStorageDriver {
             block_id = b;
             entry_id = e;
 
-            let block = self.block_mgr.get_block(&block_id)?;
+            let block = self.block_mgr.get_versioning_block(&block_id)?;
             let ver_entry = block.get_version_entry(entry_id)?;
             let entry = ver_entry.inner_entry();
 
@@ -623,10 +623,12 @@ impl<'b> BlockStorageDriver {
 
         while let Some(desc) = iter.next() {
             if desc.dirty && desc.block_type == BlockType::DataBlock {
-                let mut block = self.block_mgr.get_block_by_idx(desc.id).unwrap();
+                let mut block = self.block_mgr.get_block_by_idx(desc.id, desc.block_id, desc.block_type).unwrap();
 
-                if block.get_checkpoint_csn() < checkpoint_csn {
-                    self.buf_writer.write_data_block(&mut block, &self.block_mgr, false)?;
+                if block.get_id() == desc.block_id {
+                    if block.get_checkpoint_csn() < checkpoint_csn {
+                        self.buf_writer.write_data_block(&mut block, &self.block_mgr, false)?;
+                    }
                 }
             }
         }
@@ -642,14 +644,13 @@ impl<'b> BlockStorageDriver {
         let BlockStorageDriver {
             block_mgr: _,
             block_allocator: _,
-            version_store,
+            version_store: _,
             checkpoint_store: _,
             buf_writer,
             csns: _
         } = self;
 
         buf_writer.terminate();
-        version_store.terminate();
     }
 
     /// Add a new file to datastore.

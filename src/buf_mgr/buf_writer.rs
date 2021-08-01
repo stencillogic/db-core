@@ -111,8 +111,10 @@ impl BufWriter {
 
         while let Some(desc) = iter.next() {
             if desc.dirty && desc.block_type != BlockType::CheckpointBlock {
-                if let Some(mut block) = block_mgr.get_block_by_idx(desc.id) {
-                    Self::write_block(&mut block, block_mgr, chkpnt_allocators, false)?;
+                if let Some(mut block) = block_mgr.get_block_by_idx(desc.id, desc.block_id, desc.block_type) {
+                    if block.get_id() == desc.block_id {
+                        Self::write_block(&mut block, block_mgr, chkpnt_allocators, false)?;
+                    }
                 }
             }
         }
