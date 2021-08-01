@@ -201,7 +201,6 @@ impl VersioningStoreEntryAllocator {
     pub fn new(block_mgr: Rc<BlockMgr>, block_allocator: Rc<BlockAllocator>) -> Result<VersioningStoreEntryAllocator, Error> {
         let mut file_desc_buf = RefCell::new(vec![]);
         let (file_id, extent_id, extent_size) = Self::get_versioning_extent(&block_mgr, &mut file_desc_buf)?;
-println!("got esz {}", extent_size);
         let block_id = BlockId::init(file_id, extent_id, 1);
 
         let used_space          = Arc::new(AtomicUsize::new(2 + DBLOCK_HEADER_LEN));
@@ -253,20 +252,12 @@ println!("got esz {}", extent_size);
 
     /// Return a block for the entry to be placed in.
     pub fn get_next_entry_block(&mut self, entry_size: usize, trn_repo: &TrnRepo) -> Result<BlockLockedMut<DataBlock>, Error> {
-        // try to reserve space for the entry in the current block;
-        // if not enough space left then calculate next versioning store block id,
-        // get a free block from buffer, set block_id, and add entry to the block,
-        // set block as current;
-        // return entry.
-
         let block = self.block_mgr.get_versioning_block_mut(&self.cur_block_id)?;
         if block.get_free_space() >= entry_size {
-println!("ver block: {:?}", self.cur_block_id);
             return Ok(block);
         } else {
             self.block_mgr.set_dirty(block.get_buf_idx(), true);
             self.cur_block_id = self.calc_next_block_id(trn_repo)?;
-println!("ver block add: {:?}", self.cur_block_id);
             self.block_mgr.get_versioning_block_mut(&self.cur_block_id)
         }
     }
