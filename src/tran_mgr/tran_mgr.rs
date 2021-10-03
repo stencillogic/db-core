@@ -45,7 +45,7 @@ impl TranMgr {
         }
 
         Ok(TranMgr {
-            tsn: Arc::new(AtomicU64::new(0)),
+            tsn: Arc::new(AtomicU64::new(1)),
             nbkt,
             nobj_bkt,
             trn_set: Arc::new(trn_set),
@@ -56,6 +56,11 @@ impl TranMgr {
     /// Set initial tsn.
     pub fn set_tsn(&self, tsn: u64) {
         self.tsn.store(tsn, Ordering::Relaxed);
+    }
+
+    /// Get current tsn.
+    pub fn get_tsn(&self) -> u64 {
+        self.tsn.load(Ordering::Relaxed)
     }
 
     /// Register a new transaction and return its tsn.
@@ -159,8 +164,8 @@ mod tests {
     #[test]
     fn test_tran_mgr() {
 
-        let mut conf = ConfigMt::new();
-        let mut c = conf.get_conf();
+        let conf = ConfigMt::new();
+        let c = conf.get_conf();
         drop(c);
 
         let tm = TranMgr::new(conf).expect("Failed to create transaction manager");
@@ -171,13 +176,12 @@ mod tests {
         tm.set_tsn(tsn);
 
         let tsn = tm.start_tran();
-        let lock = tm.lock_object(tsn, &obj);
+        let _lock = tm.lock_object(tsn, &obj);
         assert!(!tm.wait_for(tsn, 100));
         tm.delete_tran(tsn);
 
-        let tsn = tsn + 1;
         let tsn = tm.start_tran();
-        let lock = tm.lock_object(tsn, &obj);
+        let _lock = tm.lock_object(tsn, &obj);
         tm.delete_tran(tsn);
 
         assert!(tm.wait_for(tsn, 100));

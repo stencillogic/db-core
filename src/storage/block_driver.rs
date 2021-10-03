@@ -1,8 +1,10 @@
 /// Interface for storage
 
 use crate::common::errors::Error;
+use crate::common::errors::ErrorKind;
 use crate::common::defs::ObjectId;
 use crate::common::defs::BlockId;
+use crate::common::defs::Vector;
 use crate::common::defs::SharedSequences;
 use crate::system::config::ConfigMt;
 use crate::storage::datastore::FileType;
@@ -46,6 +48,43 @@ pub struct Cursor {
     appending:  bool,
     tsn:        u64,
     csn:        u64,
+}
+
+
+/// Replay state keeps data for each object.
+#[derive(Debug)]
+pub struct ReplayState {
+    begin_new:      bool,
+    block_id:       BlockId,
+    entry_id:       u16,
+    entry_pos:      u16,
+    prev_block_id:  BlockId,
+    prev_entry_id:  u16,
+    tsn:            u64,
+    csn:            u64,
+}
+
+impl ReplayState {
+    pub fn new(obj: &ObjectId, entry_pos: u16, tsn: u64, csn: u64) -> Self {
+        ReplayState {
+            begin_new:      true,
+            block_id:       BlockId::from_obj(obj),
+            entry_id:       obj.entry_id,
+            entry_pos:      entry_pos,
+            prev_block_id:  BlockId::new(),
+            prev_entry_id:  0,
+            tsn,
+            csn,
+        }
+    }
+
+    pub fn update(&mut self, v: &Vector, tsn: u64, csn: u64) {
+        self.block_id  = BlockId::from_obj(&v.obj_id());
+        self.entry_id  = v.obj_id().entry_id;
+        self.entry_pos = v.entry_pos();
+        self.tsn = tsn;
+        self.csn = csn;
+    }
 }
 
 
@@ -197,6 +236,7 @@ impl<'b> BlockStorageDriver {
 
             next_block_id = block_id;
             next_entry_id = entry_id;
+            drop(block);
 
             let (b, c) = self.get_block_mut(&next_block_id)?;
             block = b;
@@ -283,7 +323,7 @@ impl<'b> BlockStorageDriver {
     }
 
     /// Write data to object opened for write.
-    pub fn write(&'b self, c: &'b mut Cursor, data: &[u8]) -> Result<(usize, u64), Error> {
+    pub fn write(&'b self, c: &'b mut Cursor, data: &[u8]) -> Result<(Vector, usize, u64), Error> {
         if c.appending {
             return self.write_append(c, data);
         } else {
@@ -309,14 +349,14 @@ impl<'b> BlockStorageDriver {
         }
     }
 
-    /// Return writing destination for the case when we are in the middle of object.
     fn write_ins(&'b self, 
                  c: &'b mut Cursor, 
                  data: &[u8], 
                  mut block: BlockLockedMut<'b, DataBlock<'b>>, 
                  entry_id: u16, 
-                 checkpoint_csn: u64) -> Result<(usize, u64), Error>
+                 checkpoint_csn: u64) -> Result<(Vector, usize, u64), Error>
     {
+        let vec = Vector::init(c.block_id, c.entry_id, c.entry_pos);
         let start_pos = c.entry_pos;
         let block_id = block.get_id();
         let mut entry = block.get_entry_mut(entry_id)?;
@@ -337,17 +377,17 @@ impl<'b> BlockStorageDriver {
         }
 
         entry.mut_slice(start_pos, c.entry_pos).copy_from_slice(&data[..written]);
-        Ok((written, checkpoint_csn))
+        Ok((vec, written, checkpoint_csn))
     }
 
-    /// Return writing destination for the case when we have reached the end of the object and need
-    /// to append now.
-    fn write_append(&'b self, c: &'b mut Cursor, data: &[u8]) -> Result<(usize, u64), Error>{
+    fn write_append(&'b self, c: &'b mut Cursor, data: &[u8]) -> Result<(Vector, usize, u64), Error> {
         let (mut cur_block, checkpoint_csn) = self.get_block_mut(&c.block_id)?;
         let cur_block_id = cur_block.get_id();
         let free = cur_block.get_free_space();
 
         if free > VERENTRY_HEADER_LEN {
+            let vec = Vector::init(c.block_id, c.entry_id, c.entry_pos);
+
             // try extending current entry
             let extend_sz = std::cmp::min(data.len(), free - VERENTRY_HEADER_LEN);
             let cbid = cur_block.get_id();
@@ -368,19 +408,15 @@ impl<'b> BlockStorageDriver {
                 self.block_allocator.set_free_info_used(&cur_block.get_id())?;
             }
 
-            Ok((extend_sz, checkpoint_csn))
+            Ok((vec, extend_sz, checkpoint_csn))
 
         } else {
             // get new block
+            let cur_entry_id = c.entry_id;
+            drop(cur_block);
+
             let (mut new_block, checkpoint_csn) = self.get_free_mut(data.len())?;
             let new_block_id = new_block.get_id();
-
-            let mut prev_entry = cur_block.get_entry_mut(c.entry_id)?;
-            if prev_entry.get_tsn() != c.tsn {
-                self.version_store.create_version(&cur_block_id, &mut prev_entry, c.tsn)?;
-                prev_entry.set_tsn(c.tsn);
-            }
-            prev_entry.set_end(false);
 
             let entry_sz = std::cmp::min(new_block.get_free_space() - VERENTRY_HEADER_LEN, data.len() + ENTRY_HEADER_LEN);
             let mut entry = new_block.add_entry(entry_sz);
@@ -391,19 +427,29 @@ impl<'b> BlockStorageDriver {
             entry.set_csn(c.csn);
             entry.set_end(true);
 
-            prev_entry.set_continuation(&new_block_id, entry.get_id());
-
             c.block_id = new_block_id;
             c.entry_id = entry.get_id();
             c.entry_pos = entry.data_size();
+
+            let vec = Vector::init(c.block_id, c.entry_id, 0);
 
             entry.mut_slice(0, c.entry_pos).copy_from_slice(&data[..c.entry_pos as usize]);
 
             if new_block.get_used_space() >= self.block_mgr.block_fill_size() {
                 self.block_allocator.set_free_info_used(&new_block.get_id())?;
             }
+            drop(new_block);
 
-            Ok((c.entry_pos as usize, checkpoint_csn))
+            let (mut cur_block, _checkpoint_csn) = self.get_block_mut(&cur_block_id)?;
+            let mut prev_entry = cur_block.get_entry_mut(cur_entry_id)?;
+            if prev_entry.get_tsn() != c.tsn {
+                self.version_store.create_version(&cur_block_id, &mut prev_entry, c.tsn)?;
+                prev_entry.set_tsn(c.tsn);
+            }
+            prev_entry.set_end(false);
+            prev_entry.set_continuation(&new_block_id, c.entry_id);
+
+            Ok((vec, c.entry_pos as usize, checkpoint_csn))
         }
     }
 
@@ -657,6 +703,68 @@ impl<'b> BlockStorageDriver {
     pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
         self.block_mgr.add_datafile(file_type, extent_size, extent_num, max_extent_num)
     }
+
+    /// Replay changes from the log.
+    pub fn replay(&self, mut rs: &mut ReplayState, data: &[u8]) -> Result<(), Error> {
+
+        let mut block = match self.get_block_mut(&rs.block_id) {
+            Ok((block, _)) => block,
+            Err(e) => {
+                if e.kind() == ErrorKind::ExtentDoesNotExist {
+                    self.block_allocator.allocate_block_with_id(&rs.block_id)?;
+                    let (ret, _) = self.get_block_mut(&rs.block_id)?;
+                    ret
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        let mut entry = match block.get_entry_mut(rs.entry_id) {
+            Ok(entry) => entry,
+            Err(e) => {
+                if e.kind() == ErrorKind::ObjectDoesNotExist {
+                    block.add_entry(data.len() + ENTRY_HEADER_LEN)
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        if entry.get_tsn() != rs.tsn {
+            self.version_store.create_version(&rs.block_id, &mut entry, rs.tsn)?;
+            entry.set_tsn(rs.tsn);
+            entry.set_csn(rs.csn);
+        }
+
+        let remaining_entry_space = (entry.data_size() - rs.entry_pos) as usize;
+
+        if remaining_entry_space < data.len() {
+            entry = block.extend_entry(rs.entry_id, data.len() - remaining_entry_space)?;
+        }
+
+        entry.mut_slice(rs.entry_pos, rs.entry_pos + data.len() as u16).copy_from_slice(&data);
+
+        if rs.begin_new {
+            entry.set_start(true);
+            rs.begin_new = false;
+        }
+        entry.set_end(true);
+
+        if (rs.prev_block_id != rs.block_id || rs.prev_entry_id != rs.entry_id) 
+            && (rs.prev_block_id.file_id | rs.prev_block_id.extent_id | rs.prev_block_id.block_id) != 0 {
+            drop(block);
+            let (mut prev_block, _) = self.get_block_mut(&rs.prev_block_id)?;
+            let mut prev_entry = prev_block.get_entry_mut(rs.prev_entry_id)?;
+            prev_entry.set_end(false);
+            prev_entry.set_continuation(&rs.block_id, rs.entry_id);
+        }
+
+        rs.prev_block_id = rs.block_id;
+        rs.prev_entry_id = rs.entry_id;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -667,7 +775,6 @@ mod tests {
     use crate::storage::datastore::FileType;
     use crate::storage::datastore::FileDesc;
     use crate::storage::datastore::FileState;
-    use crate::block_mgr::block::BasicBlock;
     use crate::common::defs::Sequence;
     use crate::common::defs::SharedSequences;
     use std::path::Path;
@@ -719,7 +826,7 @@ mod tests {
     fn write_full_slice(bd: &BlockStorageDriver, cursor: &mut Cursor, data: &[u8]) {
         let mut written = 0;
         while written < data.len() {
-            let (w, _checkpoint_csn) = bd.write(cursor, &data[written..]).expect("Failed to write to a block");
+            let (_vec, w, _checkpoint_csn) = bd.write(cursor, &data[written..]).expect("Failed to write to a block");
             written += w;
         }
     }
@@ -748,7 +855,7 @@ mod tests {
                 checkpoint_csn,
             };
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.to_owned());
         c.set_block_mgr_n_lock(10);
@@ -777,10 +884,10 @@ mod tests {
         let initial_size = 100;
         let (obj, mut cursor) = bd.create(tsn, csn, initial_size).expect("Failed to create object");
         let mut total = 3;
-        let (written, checkpoint_csn) = bd.write(&mut cursor, b"123").expect("Failed to write to a block");
+        let (_vec, written, _checkpoint_csn) = bd.write(&mut cursor, b"123").expect("Failed to write to a block");
         assert_eq!(written, total);
         let data = b"12345678901234567890";
-        for i in 0..1000 {
+        for _i in 0..1000 {
             write_full_slice(&bd, &mut cursor, data);
             total += data.len();
         }
@@ -802,13 +909,13 @@ mod tests {
         read_full_slice(&bd, &mut cursor, &mut read_buf[0..3]);
         assert_eq!(&read_buf[0..3], b"123");
 
-        for i in 0..999 {
+        for _i in 0..999 {
             let read_buf = &mut [0;20];
             read_full_slice(&bd, &mut cursor, read_buf);
             assert_eq!(&read_buf[0..data.len()], data);
         }
 
-        for i in 0..100 {
+        for _i in 0..100 {
             let read_buf = &mut [0;10];
             read_full_slice(&bd, &mut cursor, read_buf);
             assert_eq!(read_buf, data2);
@@ -880,7 +987,7 @@ mod tests {
 
         // Increase checkpoint_csn and test addition to checkpoint store.
 
-        let checkpoint_csn = csns.checkpoint_csn.get_next();
+        let _checkpoint_csn = csns.checkpoint_csn.get_next();
         let tsn = 126;
         let csn = csns.csn.get_next();
         let mut cursor = bd.begin_write(&obj, tsn, csn).expect("Failed to begin write");
@@ -924,6 +1031,62 @@ mod tests {
         read_full_slice(&bd, &mut cursor, read_buf);
 
         assert_eq!(read_buf, b"123");
+
+
+        // replay
+
+
+        let tsn = 10;
+        let csn = csns.csn.get_next();
+        let entry_pos = 10;
+
+
+        // replay in existing entry
+        let obj = ObjectId::init(3, 1, 1, 0);
+        let mut rs = ReplayState::new(&obj, entry_pos, tsn, csn);
+        let data = b"zol";
+        bd.replay(&mut rs, data).expect("Failed to replay");
+
+        let mut cursor = bd.begin_read(&obj, tsn, csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        bd.seek(&mut cursor, entry_pos as u64).expect("Failed  to seek");
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, data);
+
+
+        // new non-existent extent
+        let obj = ObjectId::init(3, 5, 1, 0);
+        let mut rs = ReplayState::new(&obj, 0, tsn, csn);
+        let data = b"gty";
+        bd.replay(&mut rs, data).expect("Failed to replay");
+
+        let mut cursor = bd.begin_read(&obj, tsn, csn).expect("Failed to start reading");
+        let read_buf = &mut [0;3];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, data);
+
+
+        // extend entry size
+        let mut rs = ReplayState::new(&obj, 0, tsn, csn);
+        let data = b"gtyrew";
+        bd.replay(&mut rs, data).expect("Failed to replay");
+
+        let mut cursor = bd.begin_read(&obj, tsn, csn).expect("Failed to start reading");
+        let read_buf = &mut [0;6];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, data);
+
+
+        // continue with the next entry
+        rs.entry_id = 1;
+        let data = b"tgb";
+        bd.replay(&mut rs, data).expect("Failed to replay");
+
+        let mut cursor = bd.begin_read(&obj, tsn, csn).expect("Failed to start reading");
+        let read_buf = &mut [0;9];
+        read_full_slice(&bd, &mut cursor, read_buf);
+        assert_eq!(read_buf, b"gtyrewtgb");
+
 
         bd.terminate();
     }

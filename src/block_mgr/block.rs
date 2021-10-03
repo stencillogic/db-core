@@ -1133,7 +1133,7 @@ mod tests {
         };
 
         let entry_sz2 = 301;
-        let mut entry2 = block.add_version_entry(entry_sz2);
+        let entry2 = block.add_version_entry(entry_sz2);
         let entry_id2 = entry2.get_id();
 
         block.set_checkpoint_csn(checkpoint_csn);
@@ -1176,7 +1176,7 @@ mod tests {
         for i in 0..block_size { block_buf2[i] = 0; }
         let stub_pin2 = AtomicU64::new(1000);
 
-        let mut block_id2 = BlockId {
+        let block_id2 = BlockId {
             file_id: 2,
             extent_id: 3,
             block_id: 4,
@@ -1247,7 +1247,7 @@ mod tests {
         let mut prev_block_id = BlockId::new();
         let mut prev_entry_id = 0;
 
-        let mut entry2_immut = block.get_version_entry(entry_id2).expect("No entry with specified id");
+        let entry2_immut = block.get_version_entry(entry_id2).expect("No entry with specified id");
         assert_eq!(entry2_immut.get_main_storage_ptr(), (ms_block_id, ms_entry_id));
         assert_eq!(entry2_immut.get_prev_created_entry_ptr(), (prev_block_id, prev_entry_id));
 
@@ -1267,13 +1267,13 @@ mod tests {
         let inner_len = entry2.data.len() - VERENTRY_HEADER_LEN;
         assert_eq!(entry2.inner_entry().data.len(), inner_len);
 
-        block.restore_entry(&entry4);
+        block.restore_entry(&entry4).expect("Failed to restore entry");
         let entry = block.get_entry_mut(entry_id).expect("No entry with specified id");
         assert_eq!(b, entry.immut().slice(0, 10)[0]);
         assert_eq!(block_size - DBLOCK_HEADER_LEN - 6 - entry_sz - entry_sz2, block.get_free_space());
         assert_eq!(entry_sz + entry_sz2, block.get_used_space());
 
-        let mut entry2_immut = block.get_version_entry(entry_id2).expect("No entry with specified id");
+        let entry2_immut = block.get_version_entry(entry_id2).expect("No entry with specified id");
         assert_eq!(entry2_immut.get_main_storage_ptr(), (ms_block_id, ms_entry_id));
         assert_eq!(entry2_immut.get_prev_created_entry_ptr(), (prev_block_id, prev_entry_id));
 
@@ -1319,7 +1319,6 @@ mod tests {
         };
 
         let mut orig_id = BlockId::init(0,0,0);
-        let mut csn = 0;
         let buf_idx = 811;
 
         for i in 0..block_size { block_buf[i] = 0; }
@@ -1345,7 +1344,7 @@ mod tests {
         orig_id.extent_id += 2;
         orig_id.block_id += 2;
         block.set_original_id(orig_id);
-        csn = 45532;
+        let mut csn = 45532;
         block.set_checkpoint_csn(csn);
         block.prepare_for_write();
 
@@ -1381,7 +1380,6 @@ mod tests {
         };
 
         let mut orig_id = BlockId::init(0,0,0);
-        let mut csn = 0;
         let buf_idx = 812;
 
         for i in 0..block_size { block_buf[i] = 0; }
@@ -1446,7 +1444,6 @@ mod tests {
         };
 
         let mut orig_id = BlockId::init(0,0,0);
-        let mut csn = 0;
         let buf_idx = 812;
 
         for i in 0..block_size { block_buf[i] = 0; }

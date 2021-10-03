@@ -219,18 +219,8 @@ impl<T> RwLockLw<T> {
     }
 
     fn wr_lock(&self) {
-
         let mut i = 0;
-        let cur = self.wr_lock.load(Ordering::Relaxed);
-
-        loop {
-
-            let cur = self.wr_lock.compare_and_swap(cur, true, Ordering::Relaxed);
-
-            if !cur {
-                break;
-            }
-
+        while let Err(_) = self.wr_lock.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed) {
             i += 1;
             if i > 10000 {
                 std::thread::yield_now();

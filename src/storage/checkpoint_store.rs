@@ -184,7 +184,7 @@ mod tests {
 
         let mut iter = cs.get_iter(checkpoint_csn).expect("Failed to get iterator");
 
-        while let Some(block) = iter.get_next().expect("Failed to get next block") {
+        while let Some(_block) = iter.get_next().expect("Failed to get next block") {
             block_num += 1;
         }
 
@@ -231,7 +231,7 @@ mod tests {
         let block_num = 100;
         let writer_num = 2;
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.to_owned());
         c.set_block_mgr_n_lock(10);

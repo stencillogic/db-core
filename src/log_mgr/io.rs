@@ -5,6 +5,8 @@ use crate::common::errors::ErrorKind;
 use crate::common::misc::SliceToIntConverter;
 use crate::common::crc32;
 use crate::common::defs::Sequence;
+use crate::common::defs::Vector;
+use crate::common::defs::VECTOR_DATA_LENGTH;
 use crate::log_mgr::fs::BufferedFileStream;
 use crate::log_mgr::fs::FileStream;
 use crate::common::defs::ObjectId;
@@ -70,20 +72,21 @@ impl LogWriter {
         })
     }
 
-    pub fn write_data(&self, csn: u64, checkpoint_csn: u64, tsn: u64, obj: &ObjectId, pos: u64, data: &[u8]) -> Result<(), Error> {
+    pub fn write_data(&self, csn: u64, checkpoint_csn: u64, tsn: u64, obj: &ObjectId, vector: &mut Vector, data: &[u8]) -> Result<(), Error> {
         let mut lrh = self.prepare_lrh(csn, checkpoint_csn, tsn, RecType::Data);
         LogOps::calc_obj_id_crc(&mut lrh.crc32, obj);
-        lrh.crc32 = crc32::crc32_num(lrh.crc32, pos);
+        let v = vector.to_data();
+        lrh.crc32 = crc32::crc32_arr(lrh.crc32, v);
         lrh.crc32 = crc32::crc32_num(lrh.crc32, data.len() as u32);
         lrh.crc32 = crc32::crc32_arr(lrh.crc32, data);
         lrh.crc32 = crc32::crc32_finalize(lrh.crc32);
 
-        let mut dst_locked = self.out_stream.get_for_write(LRH_WRITE_SZ + OBJECT_ID_WRITE_SZ + 8 + 4 + data.len()).unwrap();
+        let mut dst_locked = self.out_stream.get_for_write(LRH_WRITE_SZ + OBJECT_ID_WRITE_SZ + VECTOR_DATA_LENGTH + 4 + data.len()).unwrap();
         let mut slice: &mut [u8] = &mut dst_locked;
 
         self.write_header(&lrh, &mut slice)?;
         self.write_obj_id(obj, &mut slice)?;
-        slice.write_all(&pos.to_ne_bytes())?;
+        slice.write_all(v)?;
         slice.write_all(&(data.len() as u32).to_ne_bytes())?;
         slice.write_all(data)?;
         slice.flush()?;
@@ -122,8 +125,8 @@ impl LogWriter {
         Ok(())
     }
 
-    pub fn write_checkpoint_completed(&self, checkpoint_csn: u64, latest_commit_csn: u64) -> Result<(), Error>  {
-        let mut lrh = self.prepare_lrh(0, checkpoint_csn, 0, RecType::CheckpointCompleted);
+    pub fn write_checkpoint_completed(&self, checkpoint_csn: u64, latest_commit_csn: u64, current_tsn: u64) -> Result<(), Error>  {
+        let mut lrh = self.prepare_lrh(0, checkpoint_csn, current_tsn, RecType::CheckpointCompleted);
         lrh.crc32 = crc32::crc32_num(lrh.crc32, latest_commit_csn);
         lrh.crc32 = crc32::crc32_finalize(lrh.crc32);
 
@@ -218,8 +221,8 @@ impl LogWriter {
 pub struct LogReader {
     fs:                 FileStream,
     data_buf:           Vec<u8>,
+    vector:             Vector,
     obj:                ObjectId,
-    data_pos:           u64,
     stop_pos:           u32,
     lsn:                u64,
     csn:                u64,
@@ -234,15 +237,19 @@ impl LogReader {
         Ok(LogReader {
             fs,
             data_buf:          Vec::new(),
+            vector:            Vector::new(),
             obj:               ObjectId::new(),
-            data_pos:          0,
             stop_pos:          0,
-            lsn:               0,
-            csn:               0,
-            latest_commit_csn: 0,
-            checkpoint_csn:    0,
+            lsn:               1,
+            csn:               1,
+            latest_commit_csn: 1,
+            checkpoint_csn:    1,
         })
     }
+
+    pub fn get_vector(&mut self) -> &mut Vector {
+        &mut self.vector
+    } 
 
     pub fn find_write_position(&mut self) -> Result<(u32, u64, u64, u64), Error> {
         while let Some(_lrh) = self.read_next()? { }
@@ -250,11 +257,12 @@ impl LogReader {
         Ok((self.stop_pos, self.lsn, self.csn, self.latest_commit_csn))
     }
 
-    pub fn seek_to_latest_checkpoint(&mut self) -> Result<u64, Error> {
+    pub fn seek_to_latest_checkpoint(&mut self) -> Result<Option<(u64, u64)>, Error> {
 
         let mut seek_pos = 0;
         let mut start_seek_pos = 0;
         let mut csn = 0;
+        let mut tsn = 0;
 
         // find latest completed checkpoint
         while let Some(lrh) = self.read_next()? {
@@ -266,6 +274,7 @@ impl LogReader {
                 if csn == lrh.checkpoint_csn {
                     seek_pos = start_seek_pos;
                     self.checkpoint_csn = csn;
+                    tsn = lrh.tsn;
                 }
             }
         }
@@ -273,9 +282,9 @@ impl LogReader {
         if seek_pos > 0 {
             self.fs.seek(SeekFrom::Start(seek_pos))?;
 
-            Ok(self.checkpoint_csn)
+            Ok(Some((self.checkpoint_csn, tsn)))
         } else {
-            Err(Error::checkpoint_not_found())
+            Ok(None)
         }
     }
 
@@ -320,9 +329,9 @@ impl LogReader {
                         self.obj = self.read_object_id()?;
                         LogOps::calc_obj_id_crc(&mut crc32, &self.obj);
 
-                        self.fs.read_exact(&mut u64_buf)?;
-                        self.data_pos = u64::from_ne_bytes(u64_buf);
-                        crc32 = crc32::crc32_num(crc32, self.data_pos);
+                        self.fs.read_exact(self.vector.buf_mut())?;
+                        self.vector.update_from_buf();
+                        crc32 = crc32::crc32_arr(crc32, &self.vector.buf());
 
                         self.fs.read_exact(&mut u32_buf)?;
                         data_len = u32::from_ne_bytes(u32_buf);
@@ -381,10 +390,6 @@ impl LogReader {
     pub fn get_object_id(&self) -> ObjectId {
         self.obj
     }
-
-    pub fn get_data_pos(&self) -> u64 {
-        self.data_pos
-    } 
 
     pub fn get_data(&self) -> &[u8] {
         &self.data_buf

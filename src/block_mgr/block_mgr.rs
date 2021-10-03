@@ -244,7 +244,7 @@ impl BlockMgr {
                 return (data, buf_idx)
             } else {
                 // trigger buffer writer and wait for completion
-                panic!("No free space inf buffer");
+                panic!("No free space in the buffer");
             }
         }
     }
@@ -402,7 +402,7 @@ mod tests {
         }
         std::fs::create_dir(&dspath).expect("Failed to create test dir");
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.to_owned());
         c.set_block_mgr_n_lock(10);
@@ -414,8 +414,8 @@ mod tests {
         let block_mgr = BlockMgr::new(conf.clone()).expect("Failed to create instance");
 
         let entry_id = 0;
-        let mut entry_sz = 501;
-        let mut full_cnt = 0;
+        let entry_sz = 501;
+        let full_cnt = 0;
         let someval = 123u8;
         let block_id1 = BlockId::init(3,1,5);
         let block_id2 = BlockId::init(3,0,0);
@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(*conf.get_conf().get_block_fill_ratio() as usize * block_size / 100, block_mgr.block_fill_size());
 
         let mut block_iter = block_mgr.get_iter();
-        while let Some(desc) = block_iter.next() { }
+        while let Some(_desc) = block_iter.next() { }
         for i in 0..block_num as usize {
             let desc = block_mgr.get_block_desc(i).unwrap();
             assert!(block_mgr.get_block_by_idx(desc.id, desc.block_id, desc.block_type).is_some());

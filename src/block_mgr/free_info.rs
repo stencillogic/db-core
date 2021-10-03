@@ -452,7 +452,6 @@ mod tests {
 
     use super::*;
     use std::path::Path;
-    use std::ops::Deref;
     use crate::storage::datastore::FileState;
     use crate::storage::datastore::FileType;
     use crate::storage::datastore::FileDesc;
@@ -515,14 +514,14 @@ mod tests {
         }
         std::fs::create_dir(&dspath).expect("Failed to create test dir");
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.to_owned());
         c.set_block_mgr_n_lock(10);
         c.set_block_buf_size(block_num*block_size as u64);
         drop(c);
 
-        let init_fdesc = init_datastore(dspath, block_size);
+        let _init_fdesc = init_datastore(dspath, block_size);
 
         let block_mgr = Rc::new(BlockMgr::new(conf.clone()).expect("Failed to create instance"));
 

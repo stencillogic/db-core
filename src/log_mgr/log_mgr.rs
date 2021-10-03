@@ -2,6 +2,7 @@
 
 use crate::common::errors::Error;
 use crate::common::defs::ObjectId;
+use crate::common::defs::Vector;
 use crate::common::defs::Sequence;
 use crate::system::config::ConfigMt;
 use crate::log_mgr::fs::BufferedFileStream;
@@ -51,8 +52,8 @@ impl LogMgr {
         })
     }
 
-    pub fn write_data(&self, csn: u64, checkpoint_csn: u64, tsn: u64, obj_id: &ObjectId, pos: u64, data: &[u8]) -> Result<(), Error> {
-        self.writer.write_data(csn, checkpoint_csn, tsn, obj_id, pos, data)
+    pub fn write_data(&self, csn: u64, checkpoint_csn: u64, tsn: u64, obj_id: &ObjectId, vector: &mut Vector, data: &[u8]) -> Result<(), Error> {
+        self.writer.write_data(csn, checkpoint_csn, tsn, obj_id, vector, data)
     }
 
     pub fn write_commit(&self, csn: u64, tsn: u64) -> Result<(), Error> {
@@ -67,8 +68,8 @@ impl LogMgr {
         self.writer.write_checkpoint_begin(checkpoint_csn, latest_commit_csn)
     }
 
-    pub fn write_checkpoint_completed(&self, checkpoint_csn: u64, latest_commit_csn: u64) -> Result<(), Error> {
-        self.writer.write_checkpoint_completed(checkpoint_csn, latest_commit_csn)
+    pub fn write_checkpoint_completed(&self, checkpoint_csn: u64, latest_commit_csn: u64, current_tsn: u64) -> Result<(), Error> {
+        self.writer.write_checkpoint_completed(checkpoint_csn, latest_commit_csn, current_tsn)
     }
 
     pub fn write_delete(&self, csn: u64, checkpoint_csn: u64, tsn: u64, obj_id: &ObjectId) -> Result<(), Error> {
@@ -98,6 +99,7 @@ impl LogMgr {
 mod tests {
 
     use super::*;
+    use crate::common::defs::BlockId;
     use std::path::Path;
 
     #[test]
@@ -109,7 +111,7 @@ mod tests {
         }
         std::fs::create_dir(log_dir).expect("Failed to create test dir");
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_log_dir(log_dir.to_owned());
         drop(c);
@@ -119,20 +121,21 @@ mod tests {
         let csn = 123;
         let checkpoint_csn = 124;
         let tsn = 125;
+        let current_tsn = 234;
         let obj_id = ObjectId::init(100,101,102,103); 
-        let pos = 666; 
+        let mut vec = Vector::init(BlockId::init(1,1,1),1,1); 
         let data = [0,1,2,3,4,5,6,7,8,9];
         let latest_commit_csn = 126;
 
-        lm.write_data(csn, checkpoint_csn-1, tsn, &obj_id, pos, &data).expect("Failed to write data");
+        lm.write_data(csn, checkpoint_csn-1, tsn, &obj_id, &mut vec, &data).expect("Failed to write data");
         lm.write_commit(csn+1, tsn+1).expect("Failed to write commit");
         lm.write_rollback(csn+2, tsn+2).expect("Failed to write rollback");
         lm.write_checkpoint_begin(checkpoint_csn, latest_commit_csn).expect("Failed to write checkpoint csn");
-        lm.write_checkpoint_completed(checkpoint_csn, latest_commit_csn+1).expect("Failed to write checkpoint completed");
+        lm.write_checkpoint_completed(checkpoint_csn, latest_commit_csn+1, current_tsn).expect("Failed to write checkpoint completed");
         lm.write_delete(csn+3, checkpoint_csn, tsn+3, &obj_id).expect("Failed to delete");
-        lm.write_data(csn+4, checkpoint_csn, tsn+4, &obj_id, pos, &data).expect("Failed to write data");
+        lm.write_data(csn+4, checkpoint_csn, tsn+4, &obj_id, &mut vec, &data).expect("Failed to write data");
         lm.write_commit(csn+5, tsn+5).expect("Failed to write commit");
-        lm.write_data(csn+6, checkpoint_csn, tsn+6, &obj_id, pos, &data).expect("Failed to write data");
+        lm.write_data(csn+6, checkpoint_csn, tsn+6, &obj_id, &mut vec, &data).expect("Failed to write data");
 
         lm.terminate();
 
@@ -147,20 +150,22 @@ mod tests {
 
         let mut lr = lm.get_reader().expect("Failed to get log reader");
         let (start_pos, lsn, starting_csn, latest_commit_csn) = lr.find_write_position().expect("Failed to find write position");
-        assert_eq!(start_pos, 451);
-        assert_eq!(lsn, 9);
+        assert_eq!(start_pos, 457);
+        assert_eq!(lsn, 10);
         assert_eq!(starting_csn, csn+6);
         assert_eq!(latest_commit_csn, csn+5);
 
         let mut lr = lm.get_reader().expect("Failed to get log reader");
-        let ccsn = lr.seek_to_latest_checkpoint().expect("Failed to get latest checkpoint");
+        let (ccsn, ctsn) = lr.seek_to_latest_checkpoint().expect("Failed to get latest checkpoint").unwrap();
         assert_eq!(ccsn, checkpoint_csn);
-        let lrh = lr.read_next().expect("Failed to get latest checkpoint");
-        let lrh = lr.read_next().expect("Failed to get latest checkpoint");
+        assert_eq!(ctsn, current_tsn);
+        let _lrh = lr.read_next().expect("Failed to get latest checkpoint");
+        let _lrh = lr.read_next().expect("Failed to get latest checkpoint");
         let obj = lr.get_object_id();
         assert_eq!(obj, obj_id);
-        let data_pos = lr.get_data_pos();
-        assert_eq!(data_pos, pos);
+        let vec2 = lr.get_vector();
+        assert_eq!(vec2.obj_id(), vec.obj_id());
+        assert_eq!(vec2.entry_pos(), vec.entry_pos());
         let data1 = lr.get_data();
         assert_eq!(data1, data);
 

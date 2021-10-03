@@ -257,6 +257,7 @@ impl VersioningStoreEntryAllocator {
             return Ok(block);
         } else {
             self.block_mgr.set_dirty(block.get_buf_idx(), true);
+            drop(block);
             self.cur_block_id = self.calc_next_block_id(trn_repo)?;
             self.block_mgr.get_versioning_block_mut(&self.cur_block_id)
         }
@@ -373,7 +374,7 @@ impl TrnRepo {
             let st = *start_time;
             let pos = body.start_time.binary_search(start_time).unwrap_or_else(|x| x);
             body.start_time.remove(pos);
-            if pos == 0 && st > self.get_earliest_start_time() {
+            if pos == 0 && st > self.get_earliest_start_time() && body.start_time.len() > 0 {
                 self.earliest_start_time.store(body.start_time[0], Ordering::Relaxed);
             }
         }

@@ -352,14 +352,14 @@ mod tests {
         let block_size = 8192;
         let block_num = 100;
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.to_owned());
         c.set_block_mgr_n_lock(10);
         c.set_block_buf_size(block_num*block_size as u64);
         drop(c);
 
-        let init_fdesc = init_datastore(dspath, block_size);
+        let _init_fdesc = init_datastore(dspath, block_size);
 
         let block_mgr = Rc::new(BlockMgr::new(conf.clone()).expect("Failed to create instance"));
 
@@ -437,7 +437,7 @@ mod tests {
         for i in 1..16 {
             let block_id = BlockId::init(3,1,i);
             let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
-            let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
+            let db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
             assert_eq!(db.get_checkpoint_csn(), 1);
             assert!(db.has_entry(0));
             drop(db);
@@ -445,7 +445,7 @@ mod tests {
 
             let block_id = BlockId::init(5, if i<10 {2} else {4}, if i<10 {i} else {i - 10});
             let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
-            let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
+            let db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
             assert_eq!(db.get_checkpoint_csn(), 1);
             assert!(db.has_entry(0));
             drop(db);
@@ -454,7 +454,7 @@ mod tests {
 
         let block_id = BlockId::init(4,1,1);
         let ba: Ref<BlockArea> = ds.load_block(&block_id, FileState::InUse).expect("Failed to load block");
-        let mut db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
+        let db = DataBlock::new(block_id, 0, Pinned::<BlockArea>::new(ba.clone(), &stub_pin));
         assert_eq!(db.get_checkpoint_csn(), 123);
     }
 }

@@ -16,6 +16,7 @@ use crate::common::defs::SharedSequences;
 use crate::system::config::ConfigMt;
 use crate::log_mgr::log_mgr::LogMgr;
 use crate::storage::driver::StorageDriver;
+use crate::tran_mgr::tran_mgr::TranMgr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -44,7 +45,8 @@ impl Checkpointer {
 
     pub fn new(log_mgr:             LogMgr, 
                csns:                SharedSequences, 
-               conf:                ConfigMt
+               conf:                ConfigMt,
+               tran_mgr:            TranMgr
                ) -> Result<Self, Error> 
     {
         let processed_data_threashold = *conf.get_conf().get_checkpoint_data_threshold();
@@ -63,7 +65,8 @@ impl Checkpointer {
                                       checkpoint_ready2, 
                                       log_mgr.clone(),
                                       csns.clone(), 
-                                      checkpoint_req_count2);
+                                      checkpoint_req_count2,
+                                      tran_mgr);
         });
 
         assert!(processed_data_threashold > 0);
@@ -101,14 +104,13 @@ impl Checkpointer {
         let mut req_count = self.checkpoint_req_count.load(Ordering::Relaxed);
 
         while req_count < 2 {
-            let new_req_count = self.checkpoint_req_count.compare_and_swap(req_count, req_count + 1, Ordering::Relaxed);
-            if new_req_count == req_count {
+            if let Err(new_req_count) = self.checkpoint_req_count.compare_exchange(req_count, req_count + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                req_count = new_req_count;
+            } else {
                 if req_count == 0 {
                     self.checkpoint_ready.send(true, false);
                 }
                 break;
-            } else {
-                req_count = new_req_count;
             }
         }
 
@@ -121,7 +123,8 @@ impl Checkpointer {
                            checkpoint_ready:    SyncNotification<bool>, 
                            log_mgr:             LogMgr,
                            csns:                SharedSequences,
-                           checkpoint_req_count: Arc<AtomicU32>)
+                           checkpoint_req_count: Arc<AtomicU32>,
+                           tran_mgr:            TranMgr)
     {
         match StorageDriver::new(conf, csns.clone()) {
             Ok(sd) => {
@@ -151,7 +154,9 @@ impl Checkpointer {
                                 if let Err(e) = sd.checkpoint(checkpoint_csn) {
                                     error!("Failed to perform checkpoint: {}", e);
                                 } else {
-                                    if let Err(e) = log_mgr.write_checkpoint_completed(checkpoint_csn-1, csns.latest_commit_csn.load(Ordering::Relaxed)) {
+                                    if let Err(e) = log_mgr.write_checkpoint_completed(checkpoint_csn-1,
+                                        csns.latest_commit_csn.load(Ordering::Relaxed),
+                                        tran_mgr.get_tsn()) {
                                         error!("Failed to write to log about checkpoint completion, error: {}", e);
                                     } else {
                                         info!("Checkpoint completed successfully");

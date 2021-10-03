@@ -284,11 +284,10 @@ impl<I, E> BufMgr<I, E>
                 cur & (!DIRTY_BIT)
             };
 
-            let cur2 = self.pins[idx].compare_and_swap(cur, new_val, Ordering::Relaxed);
-            if cur2 == cur {
-                return;
-            } else {
+            if let Err(cur2) = self.pins[idx].compare_exchange(cur, new_val, Ordering::Relaxed, Ordering::Relaxed) {
                 cur = cur2;
+            } else {
+                return;
             }
         }
     }
@@ -370,11 +369,10 @@ impl<I, E> BufMgr<I, E>
                 return None;
             }
 
-            let cur2 = self.pins[buf_idx].compare_and_swap(cur, cur+1, Ordering::Relaxed);
-            if cur2 == cur {
-                return Some(Pinned::new(self.get_block_area(buf_idx), &self.pins[buf_idx]));
-            } else {
+            if let Err(cur2) = self.pins[buf_idx].compare_exchange(cur, cur+1, Ordering::Relaxed, Ordering::Relaxed) {
                 cur = cur2;
+            } else {
+                return Some(Pinned::new(self.get_block_area(buf_idx), &self.pins[buf_idx]));
             }
         }
     }
@@ -385,7 +383,7 @@ impl<I, E> BufMgr<I, E>
         if cur & (PINLOCK_BIT | PIN_COUNTER_MASK) != 0 {
             return false;
         } else {
-            self.pins[buf_idx].compare_and_swap(cur, cur | PINLOCK_BIT, Ordering::Relaxed) == 0
+            self.pins[buf_idx].compare_exchange(cur, cur | PINLOCK_BIT, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         }
     }
 
@@ -522,15 +520,15 @@ mod tests {
         let mut block_buf = [0u8; 8192];
         block_buf[0] = 1;
 
-        let (mut block, buf_idx) = bm.allocate_on_cache(&block_id, BlockType::DataBlock).expect("Failed to allocate block");
+        let (mut block, _buf_idx) = bm.allocate_on_cache(&block_id, BlockType::DataBlock).expect("Failed to allocate block");
         block.copy_from_slice(&block_buf);
         assert!(bm.get_block(&block_id).is_some());
         drop(block);
 
-        for i in 0..block_num {
+        for _i in 0..block_num {
             block_id.block_id += 1;
             block_buf[0] += 1;
-            let (mut block, buf_idx) = bm.allocate_on_cache(&block_id, BlockType::DataBlock).expect("Failed to allocate block");
+            let (mut block, _buf_idx) = bm.allocate_on_cache(&block_id, BlockType::DataBlock).expect("Failed to allocate block");
             block.copy_from_slice(&block_buf);
             drop(block);
         }
@@ -539,26 +537,26 @@ mod tests {
 
         for i in 0..block_num {
             block_id.block_id += 1;
-            let (block, buf_idx) = bm.get_block(&block_id).expect("Block was not found");
+            let (block, _buf_idx) = bm.get_block(&block_id).expect("Block was not found");
             assert_eq!(i + 2, (&block)[0] as usize);
             drop(block);
         }
 
         block_id.block_id = 10;
-        let (block, buf_idx) = bm.get_block(&block_id).expect("Block was not found");
+        let (block, _buf_idx) = bm.get_block(&block_id).expect("Block was not found");
         drop(block);
 
         block_id.block_id = 1000;
-        for i in 1..block_num {
+        for _i in 1..block_num {
             block_id.block_id += 1;
-            let (mut block, buf_idx) = bm.allocate_on_cache(&block_id, BlockType::DataBlock).expect("Failed to allocate block");
+            let (mut block, _buf_idx) = bm.allocate_on_cache(&block_id, BlockType::DataBlock).expect("Failed to allocate block");
             block.copy_from_slice(&block_buf);
             assert!(bm.get_block(&block_id).is_some());
             drop(block);
         }
 
         block_id.block_id = 0;
-        for i in 0..block_num {
+        for _i in 0..block_num {
             block_id.block_id += 1;
             if block_id.block_id == 10 {
                 bm.get_block(&block_id).expect("Block was not found");

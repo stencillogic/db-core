@@ -674,17 +674,15 @@ impl DataStore {
     /// return next free file id for a new data file
     fn next_file_id(&self) -> Result<u16, Error> {
         let mut current = self.seq_file_id.load(Ordering::Relaxed);
-        let mut ret;
         loop {
             if current == std::u16::MAX {
                 return Err(Error::file_id_overflow());
             }
 
-            ret = self.seq_file_id.compare_and_swap(current, current+1, Ordering::Relaxed);
-            if ret == current {
-                return Ok(current + 1);
-            } else {
+            if let Err(ret) = self.seq_file_id.compare_exchange(current, current+1, Ordering::Relaxed, Ordering::Relaxed) {
                 current = ret;
+            } else {
+                return Ok(current + 1);
             }
         }
     }
@@ -898,7 +896,7 @@ mod tests {
         std::fs::create_dir(&dspath).expect("Failed to create test dir");
 
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.clone());
         drop(c);

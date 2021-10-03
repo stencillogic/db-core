@@ -156,6 +156,29 @@ impl BlockAllocator {
         return Err(Error::db_size_limit_reached());
     }
 
+    /// Allocate block with specified id.
+    pub fn allocate_block_with_id(&self, block_id: &BlockId) -> Result<(), Error> {
+        self.block_mgr.get_data_files(&mut self.file_desc_buf.borrow_mut());
+        let file_desc_set = &self.file_desc_buf.borrow();
+        for desc in file_desc_set.iter() {
+            if desc.file_id == block_id.file_id {
+                let mut extent_num = desc.extent_num;
+                while extent_num <= block_id.extent_id {
+                    if desc.extent_num >= desc.max_extent_num {
+                        return Err(Error::db_size_limit_reached());
+                    } else {
+                        self.block_mgr.add_extent(desc.file_id)?;
+                        self.free_info.add_extent(desc.file_id)?;
+                    }
+                    extent_num += 1;
+                }
+
+                return Ok(());
+            }
+        }
+        return Err(Error::file_does_not_exist());
+    }
+
     // return next generated checkpoint block_id.
     fn get_next_checkpoint_block_id(&self, checkpoint_csn: u64) -> BlockId {
         // use fake block_id because it is not considered by writer when writer
@@ -287,14 +310,14 @@ mod tests {
         let block_size = 8192;
         let block_num = 100;
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_datastore_path(dspath.to_owned());
         c.set_block_mgr_n_lock(10);
         c.set_block_buf_size(block_num*block_size as u64);
         drop(c);
 
-        let init_fdesc = init_datastore(dspath, block_size);
+        let _init_fdesc = init_datastore(dspath, block_size);
 
         let block_mgr = Rc::new(BlockMgr::new(conf.clone()).expect("Failed to create instance"));
 
@@ -321,11 +344,19 @@ mod tests {
         let block_id = BlockId::init(3, 3, 1);
         let block = ba.allocate_block().expect("Failed to allocate block");
         assert_eq!(block_id, block.get_id());
+        drop(block);
 
         let block = ba.get_free_checkpoint_block(checkpoint_csn).expect("Failed to get checkpoint block");
         assert_eq!(BlockId::init(0, 0, 2), block.get_id());
         drop(block);
         let block = ba.get_free_checkpoint_block(checkpoint_csn+1).expect("Failed to get checkpoint block");
         assert_eq!(BlockId::init(1, 0, 3), block.get_id());
+        drop(block);
+
+
+        let block_id = BlockId::init(3, 5, 1);
+        assert!(block_mgr.get_block(&block_id).is_err());
+        ba.allocate_block_with_id(&block_id).expect("Failed to allocate block");
+        assert!(block_mgr.get_block(&block_id).is_ok());
     }
 }

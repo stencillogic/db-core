@@ -2,10 +2,12 @@
 
 use crate::common::errors::Error;
 use crate::common::defs::ObjectId;
+use crate::common::defs::Vector;
 use crate::common::defs::SharedSequences;
 use crate::storage::block_driver::BlockStorageDriver;
 use crate::storage::block_driver::BlockStorageSharedState;
 use crate::storage::block_driver::Cursor;
+use crate::storage::block_driver::ReplayState;
 use crate::system::config::ConfigMt;
 use crate::storage::datastore::FileType;
 
@@ -22,12 +24,24 @@ pub struct Handle {
     cursor: Cursor,
 }
 
+/// Handle for replaying object changes.
+pub struct ReplayHandle {
+    rs: ReplayState,
+}
+
+impl ReplayHandle {
+    pub fn update(&mut self, v: &Vector, tsn: u64, csn: u64) {
+        self.rs.update(v, tsn, csn);
+    }
+}
+
 
 /// Storage driver is abstration for providing access to data storage.
 /// It serves as wrapper for actual implementation, e.g. block store.
 pub struct StorageDriver {
     driver: BlockStorageDriver,
 }
+
 
 impl<'b> StorageDriver {
 
@@ -90,7 +104,7 @@ impl<'b> StorageDriver {
     }
 
     /// Write data to object opened for write.
-    pub fn write(&'b self, h: &'b mut Handle, data: &[u8]) -> Result<(usize, u64), Error> {
+    pub fn write(&'b self, h: &'b mut Handle, data: &[u8]) -> Result<(Vector, usize, u64), Error> {
         self.driver.write(&mut h.cursor, data)
     }
 
@@ -127,5 +141,17 @@ impl<'b> StorageDriver {
     pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
         self.driver.add_datafile(file_type, extent_size, extent_num, max_extent_num)
     }
+
+    /// Begin replay of an object.
+    pub fn begin_replay(&self, obj: &ObjectId, entry_pos: u16, tsn: u64, csn: u64) -> ReplayHandle {
+        ReplayHandle {
+            rs: ReplayState::new(obj, entry_pos, tsn, csn)
+        }
+    }
+
+    /// Replay changes from the log.
+    pub fn replay(&self, rh: &mut ReplayHandle, data: &[u8]) -> Result<(), Error> {
+        self.driver.replay(&mut rh.rs, data)
+    } 
 }
 

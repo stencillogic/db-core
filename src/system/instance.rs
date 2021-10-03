@@ -2,7 +2,6 @@
 
 
 use crate::common::errors::Error;
-use crate::common::errors::ErrorKind;
 use crate::common::defs::Sequence;
 use crate::common::defs::ObjectId;
 use crate::common::defs::SharedSequences;
@@ -45,7 +44,7 @@ impl Instance {
 
         let csn =               Sequence::new(log_mgr.starting_csn());
         let latest_commit_csn = Arc::new(AtomicU64::new(log_mgr.latest_commit_csn()));
-        let checkpoint_csn =    Sequence::new(0);
+        let checkpoint_csn =    Sequence::new(1);
         let csns = SharedSequences {
                 csn,
                 latest_commit_csn,
@@ -56,7 +55,8 @@ impl Instance {
 
         let checkpointer =      Arc::new(Checkpointer::new(log_mgr.clone(), 
                                                            csns.clone(),
-                                                           conf.clone())?);
+                                                           conf.clone(),
+                                                           tran_mgr.clone())?);
 
         let ret = Instance {
             conf,
@@ -98,7 +98,7 @@ impl Instance {
     }
 
     /// commit transaction
-    pub fn commit(self, t: Transaction) -> Result<(), Error> {
+    pub fn commit(&self, t: Transaction) -> Result<(), Error> {
         if t.last_write_csn > t.start_csn {
             let commit_csn = self.csns.csn.get_next();
             self.log_mgr.write_commit(commit_csn, t.tsn)?;
@@ -110,7 +110,7 @@ impl Instance {
     }
 
     /// rollback transaction
-    pub fn rollback(self, t: Transaction) -> Result<(), Error> {
+    pub fn rollback(&self, t: Transaction) -> Result<(), Error> {
         if t.last_write_csn > t.start_csn {
             self.log_mgr.write_rollback(t.last_write_csn, t.tsn)?;
             self.storage_driver.rollback_transaction(t.tsn)?;
@@ -142,8 +142,10 @@ impl Instance {
         let _guard = self.tran_mgr.lock_object(t.tsn, obj_id);
 
         if let Some(txn) = self.storage_driver.is_locked(obj_id)? {
-            if !self.tran_mgr.wait_for(txn, timeout) {
-                return Err(Error::timeout());
+            if txn != t.tsn {
+                if !self.tran_mgr.wait_for(txn, timeout) {
+                    return Err(Error::timeout());
+                }
             }
         }
 
@@ -196,23 +198,27 @@ impl Instance {
     }
 
     fn update_latest_commit_csn(&self, csn: u64) {
-        let mut cur_csn = self.csns.latest_commit_csn.load(Ordering::Relaxed);
-        while cur_csn < csn {
-            cur_csn = self.csns.latest_commit_csn.compare_and_swap(cur_csn, csn, Ordering::Relaxed);
+        let cur_csn = self.csns.latest_commit_csn.load(Ordering::Relaxed);
+        while let Err(cur_csn)  = self.csns.latest_commit_csn.compare_exchange(cur_csn, csn, Ordering::Relaxed, Ordering::Relaxed) {
+            if cur_csn >= csn {
+                return
+            }
         }
     }
 
     fn restore_state(&self) -> Result<(), Error> {
 
         let mut log_reader = self.log_mgr.get_reader()?;
-        let checkpoint_csn = log_reader.seek_to_latest_checkpoint()?;
+        if let Some((checkpoint_csn, tsn)) = log_reader.seek_to_latest_checkpoint()? {
 
-        self.csns.checkpoint_csn.set(checkpoint_csn);
-
-        self.storage_driver.restore_checkpoint(checkpoint_csn)?;
+            self.tran_mgr.set_tsn(tsn);
+            self.csns.checkpoint_csn.set(checkpoint_csn);
+            self.storage_driver.restore_checkpoint(checkpoint_csn)?;
+        } else {
+            log_reader = self.log_mgr.get_reader()?;
+        }
 
         let tsn = self.replay_changes(log_reader)?;
-
         self.tran_mgr.set_tsn(tsn);
 
         Ok(())
@@ -220,7 +226,7 @@ impl Instance {
 
     fn replay_changes(&self, mut log_reader: LogReader) -> Result<u64, Error> {
         let mut trn_set = HashMap::new();
-        let mut max_tsn = 0;
+        let mut max_tsn = 1;
 
         while let Some(lrh) = log_reader.read_next()? {
 
@@ -235,6 +241,7 @@ impl Instance {
                 RecType::Commit => {
                     trn_set.remove(&tsn);
                     self.update_latest_commit_csn(csn);
+                    self.storage_driver.finish_tran(tsn);
                 },
                 RecType::Rollback => {
                     self.storage_driver.rollback_transaction(lrh.tsn)?;
@@ -249,30 +256,15 @@ impl Instance {
 
                     let obj = log_reader.get_object_id();
                     if !obj_set.contains_key(&obj) {
-                        let (_, handle) = match self.storage_driver.begin_write(&obj, tsn, csn) {
-                            Ok(handle) => Ok((obj, handle)),
-                            Err(e) => {
-                                if e.kind() == ErrorKind::ObjectDoesNotExist {
-                                    self.storage_driver.create(tsn, csn, log_reader.get_data().len())
-                                } else {
-                                    Err(e)
-                                }
-                            }
-                        }?;
-
-                        obj_set.insert(obj, (handle, 0));
+                        let vec = log_reader.get_vector();
+                        let rh = self.storage_driver.begin_replay(&vec.obj_id(), vec.entry_pos(), tsn, csn);
+                        obj_set.insert(obj, rh);
                     }
 
-                    let mut obj_state = obj_set.get_mut(&obj).unwrap();
-
-                    let write_pos = log_reader.get_data_pos();
-                    if write_pos > obj_state.1 {
-                        self.storage_driver.seek(&mut obj_state.0, write_pos - obj_state.1)?;
-                        obj_state.1 = write_pos;
-                    }
-
-                    self.write_data_fully(&mut obj_state.0, log_reader.get_data())?;
-                    obj_state.1 += log_reader.get_data().len() as u64;
+                    let rh = obj_set.get_mut(&obj).unwrap();
+                    let vec = log_reader.get_vector();
+                    rh.update(&vec, tsn, csn);
+                    self.storage_driver.replay(rh, log_reader.get_data())?;
                 },
                 RecType::Delete => {
                     if !trn_set.contains_key(&tsn) {
@@ -297,18 +289,6 @@ impl Instance {
         }
 
         Ok(max_tsn)
-    }
-
-    fn write_data_fully(&self, mut handle: &mut Handle, data: &[u8]) -> Result<(), Error> {
-
-        let mut written = 0;
-
-        while written < data.len() {
-            let (w, _) = self.storage_driver.write(&mut handle, &data[written..])?;
-            written += w;
-        }
-
-        Ok(())
     }
 
     /// Build instance using shared state.
@@ -431,10 +411,11 @@ impl<'a> ObjectWrite<'a> {
         let mut written = 0;
 
         while written < data.len() {
-            let (w, checkpoint_csn) = self.obj.instance.storage_driver.write(&mut self.obj.handle, &data[written..])?;
+            let (mut vector, w, checkpoint_csn) = self.obj.instance.storage_driver.write(&mut self.obj.handle, &data[written..])?;
+            let written_data = &data[written..written+w];
+            self.obj.instance.log_mgr.write_data(self.txn.last_write_csn, checkpoint_csn, self.txn.tsn, &self.obj.id, &mut vector, written_data)?;
+            self.obj.instance.checkpointer.register_processed_data_size(written_data.len() as u64);
             written += w;
-            self.obj.instance.log_mgr.write_data(self.txn.last_write_csn, checkpoint_csn, self.txn.tsn, &self.obj.id, self.obj.cur_pos, data)?;
-            self.obj.instance.checkpointer.register_processed_data_size(data.len() as u64);
         }
 
         self.obj.cur_pos += data.len() as u64;
@@ -517,6 +498,7 @@ mod tests {
     use crate::storage::datastore::FileDesc;
     use std::path::Path;
 
+
     fn init_datastore(dspath: &str, block_size: usize) -> Vec<FileDesc> {
 
         if Path::new(dspath).exists() {
@@ -558,7 +540,33 @@ mod tests {
         fdset
     }
 
-/*    #[test]
+
+    fn create_data(len: usize) -> Vec<u8> {
+        let mut ret = vec![];
+        for _i in 0..len {
+            ret.push(rand::random::<u8>());
+        }
+        ret
+    }
+
+    fn write_full(obj: &mut ObjectWrite, data: &[u8]) {
+        obj.write_next(data).expect("Failed to write data");
+    }
+
+    fn read_full(obj: &mut Object, data: &[u8]) {
+        let mut read_buf = vec![0u8;data.len()];
+        let mut read = 0;
+        let len = read_buf.len();
+        while read < len {
+            let r = obj.read_next(&mut read_buf[read..len]).expect("Failed to read");
+            if r == 0 {break;}
+            read += r;
+        }
+        assert_eq!(read, len);
+        assert_eq!(read_buf, data);
+    }
+
+    #[test]
     fn test_instance() {
         let dspath = "/tmp/test_instance_098123";
         let log_dir = "/tmp/test_instance_56445";
@@ -571,33 +579,108 @@ mod tests {
         }
         std::fs::create_dir(log_dir).expect("Failed to create test dir");
 
-        let mut conf = ConfigMt::new();
+        let conf = ConfigMt::new();
         let mut c = conf.get_conf();
         c.set_log_dir(log_dir.to_owned());
         c.set_datastore_path(dspath.to_owned());
         drop(c);
 
-        let instance = Instance::new(conf).expect("Failed to create instance");
-    }
-*/
-/*
-    #[test]
-    fn test_send_to_thrread() {
-        let conf = ConfigMt::new();
-        let instance = Instance::new(conf).expect("Failed to create instance");
+        let instance = Instance::new(conf.clone()).expect("Failed to create instance");
+
+
+        // create second instance from shared state and move to other thread 
+
 
         let ss = instance.get_shared_state().expect("Failed to get shared state");
 
         let th = std::thread::spawn(move || {
             let instance2 = Instance::from_shared_state(ss).expect("Failed to create instance");
             let trn = instance2.begin_transaction().expect("Failed to begin transaction 1");
-            instance2.rollback(trn);
+            instance2.rollback(trn).expect("Failed to rollback_transaction");
+            instance2.terminate();
         });
 
         let trn = instance.begin_transaction().expect("Failed to begin transaction 2");
-        instance.rollback(trn);
+        instance.rollback(trn).expect("Failed to rollback_transaction");
 
-        th.join();
+        th.join().unwrap();
+
+
+        // add data file 
+
+
+        instance.add_datafile(FileType::DataStoreFile, 1000, 10, 1000).expect("Failed to add data file");
+
+
+
+        // read, write & delete
+
+
+        let data = create_data(block_size * 3);
+
+        let mut trn = instance.begin_transaction().expect("Failed to begin transaction");
+
+        let mut ocr = instance.open_create(&mut trn, 200).expect("Failed to create object");
+        let obj_id = ocr.get_id();
+        write_full(&mut ocr, &data);
+        drop(ocr);
+
+        let mut ord = instance.open_read(&obj_id, &trn).expect("Failed to open for reading");
+        assert_eq!(ord.get_id(), obj_id);
+        read_full(&mut ord, &data);
+        drop(ord);
+
+        let data2 = create_data(block_size);
+        let mut owr = instance.open_write(&obj_id, &mut trn, 1000).expect("Failed to open for writing");
+        assert_eq!(owr.get_id(), obj_id);
+        write_full(&mut owr, &data2);
+        owr.seek((block_size + block_size/2) as u64).expect("Failed to seek");
+        write_full(&mut owr, &data2);
+        drop(owr);
+
+        let mut new_data = vec![0; block_size * 3 + block_size / 2];
+        new_data[0..data.len()].copy_from_slice(&data);
+        new_data[0..data2.len()].copy_from_slice(&data2);
+        let offset = block_size * 2 + block_size / 2;
+        new_data[offset..offset + data2.len()].copy_from_slice(&data2);
+
+        let mut ord = instance.open_read(&obj_id, &trn).expect("Failed to open for reading");
+        assert_eq!(ord.get_id(), obj_id);
+        read_full(&mut ord, &new_data);
+        drop(ord);
+
+        instance.delete(&obj_id, &mut trn, 1000).expect("Failed to delete object");
+        instance.commit(trn).expect("Failed to commit transaction");
+
+        let mut trn = instance.begin_transaction().expect("Failed to begin transaction");
+        let res = instance.open_read(&obj_id, &trn);
+        assert!(res.is_err());
+
+        let mut ocr = instance.open_create(&mut trn, 300).expect("Failed to create object");
+        let obj_id = ocr.get_id();
+        write_full(&mut ocr, &data);
+        drop(ocr);
+        instance.commit(trn).expect("Failed to commit transaction");
+
+        instance.terminate();
+
+
+        // open existing database
+        
+
+        let instance = Instance::new(conf.clone()).expect("Failed to create instance");
+
+        let trn = instance.begin_transaction().expect("Failed to begin transaction");
+
+        let mut ord = instance.open_read(&obj_id, &trn).expect("Failed to open for reading");
+        read_full(&mut ord, &data);
+        drop(ord);
+
+
+        instance.rollback(trn).expect("Failed to rollback transaction");
+
+
+        // concurrent writes
     }
-*/
+
 }

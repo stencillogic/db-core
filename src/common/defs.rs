@@ -1,8 +1,10 @@
 /// Different reusable definitions
 
 
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::common::misc::SliceToIntConverter;
 
 
 /// object identifier
@@ -131,5 +133,73 @@ pub struct SharedSequences {
     pub csn:                Sequence,
     pub latest_commit_csn:  Arc<AtomicU64>,
     pub checkpoint_csn:     Sequence,
+}
+
+
+
+pub const VECTOR_DATA_LENGTH: usize = 10;
+
+
+/// Vector (data pointer) 
+#[derive(Clone, Copy, Debug)]
+pub struct Vector {
+    obj:        ObjectId,
+    entry_pos:  u16,
+    data:       [u8;VECTOR_DATA_LENGTH],
+}
+
+
+impl Vector {
+    pub fn new() -> Self {
+        Vector {
+            obj: ObjectId::new(),
+            entry_pos: 0,
+            data: [0;VECTOR_DATA_LENGTH],
+        }
+    }
+
+    pub fn init(block_id: BlockId, entry_id: u16, entry_pos: u16) -> Self {
+        let obj = ObjectId::init(block_id.file_id, block_id.extent_id, block_id.block_id, entry_id);
+        Vector {
+            obj,
+            entry_pos,
+            data: [0;VECTOR_DATA_LENGTH],
+        }
+    }
+
+    pub fn update_from_buf(&mut self) {
+        self.obj.file_id = u16::slice_to_int(&self.data[0..2]).unwrap();
+        self.obj.extent_id = u16::slice_to_int(&self.data[2..4]).unwrap();
+        self.obj.block_id = u16::slice_to_int(&self.data[4..6]).unwrap();
+        self.obj.entry_id = u16::slice_to_int(&self.data[6..8]).unwrap();
+        self.entry_pos = u16::slice_to_int(&self.data[8..10]).unwrap();
+    }
+
+    pub fn to_data(&mut self) -> &[u8] {
+        let mut slice = &mut self.data[0..VECTOR_DATA_LENGTH];
+        slice.write_all(&self.obj.file_id.to_ne_bytes()).unwrap();
+        slice.write_all(&self.obj.extent_id.to_ne_bytes()).unwrap();
+        slice.write_all(&self.obj.block_id.to_ne_bytes()).unwrap();
+        slice.write_all(&self.obj.entry_id.to_ne_bytes()).unwrap();
+        slice.write_all(&self.entry_pos.to_ne_bytes()).unwrap();
+        slice.flush().unwrap();
+        &self.data
+    }
+
+    pub fn buf_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    pub fn buf(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn obj_id(&self) -> ObjectId {
+        self.obj
+    }
+
+    pub fn entry_pos(&self) -> u16 {
+        self.entry_pos
+    } 
 }
 
