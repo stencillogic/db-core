@@ -4,11 +4,10 @@
 use crate::common::errors::Error;
 use crate::system::config::ConfigMt;
 use crate::common::defs::ObjectId;
+use crate::common::defs::Sequence;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Condvar;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::collections::HashSet;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,7 +16,7 @@ use std::time::Duration;
 /// TranMgr keeps track of transactions.
 #[derive(Clone)]
 pub struct TranMgr {
-    tsn:        Arc<AtomicU64>,
+    tsn:        Sequence,
     nbkt:       usize,
     nobj_bkt:   usize,
     trn_set:    Arc<Vec<(Mutex<HashSet<u64>>, Condvar)>>,
@@ -45,7 +44,7 @@ impl TranMgr {
         }
 
         Ok(TranMgr {
-            tsn: Arc::new(AtomicU64::new(1)),
+            tsn: Sequence::new(1),
             nbkt,
             nobj_bkt,
             trn_set: Arc::new(trn_set),
@@ -55,18 +54,17 @@ impl TranMgr {
 
     /// Set initial tsn.
     pub fn set_tsn(&self, tsn: u64) {
-        self.tsn.store(tsn, Ordering::Relaxed);
+        self.tsn.set(tsn);
     }
 
     /// Get current tsn.
     pub fn get_tsn(&self) -> u64 {
-        self.tsn.load(Ordering::Relaxed)
+        self.tsn.get_cur()
     }
 
     /// Register a new transaction and return its tsn.
     pub fn start_tran(&self) -> u64 {
-        let tsn = self.get_next_tsn();
-
+        let tsn = self.tsn.get_next();
         let b = (tsn % self.nbkt as u64) as usize;
         let (lock, _) = &self.trn_set[b];
         let mut hm = lock.lock().unwrap();
@@ -121,14 +119,11 @@ impl TranMgr {
             }
         } else {
             while hm.contains(&tsn) {
-                hm = cvar.wait(hm).unwrap();
+                let (h, _w) = cvar.wait_timeout(hm, Duration::from_millis(1000u64)).unwrap();
+                hm = h;
             }
         }
         return true;
-    }
-
-    fn get_next_tsn(&self) -> u64 {
-        self.tsn.load(Ordering::Relaxed)
     }
 
     fn unlock_object(&self, obj_id: &ObjectId) {
@@ -176,8 +171,9 @@ mod tests {
         tm.set_tsn(tsn);
 
         let tsn = tm.start_tran();
-        let _lock = tm.lock_object(tsn, &obj);
+        let lock = tm.lock_object(tsn, &obj);
         assert!(!tm.wait_for(tsn, 100));
+        drop(lock);
         tm.delete_tran(tsn);
 
         let tsn = tm.start_tran();

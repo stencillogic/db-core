@@ -208,11 +208,9 @@ impl BufferedFileStream {
 
         let mut terminated_cnt = 0;
 
-        let mut buf_id = 0;
-
         loop {
 
-            let slice: &mut [u8] = buf.reserve_for_reaed(buf_id);
+            let (slice, buf_id) = buf.reserve_for_read();
 
             while let Err(e) = fs.write_all(slice) {
                 error!("Failed to write to transaction log file: {}", e);
@@ -238,8 +236,6 @@ impl BufferedFileStream {
 
                 buf.set_buf_appendable(buf_id);
             }
-
-            buf_id = 1 - buf_id;
         }
     }
 }

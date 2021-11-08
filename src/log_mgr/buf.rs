@@ -371,13 +371,13 @@ impl<T> DoubleBuf<T> {
     }
 
 
-    /// Return buffer slice for buffer `buf_id` when buffer is ready to be processed by the writer.
-    /// If the buffer is not full the method blocks until buffer is ready for processing.
-    pub fn reserve_for_reaed(&self, buf_id: usize) -> &mut [T] {
+    /// Return buffer slice with data and bffer id.
+    /// If the buffer is not full/ready the method blocks until buffer is ready for processing.
+    pub fn reserve_for_read(&self) -> (&mut [T], usize) {
 
-        self.wait_for_buf(BufState::Readable as u32, buf_id);
+        let (buf_id, _) = self.wait_for(BufState::Readable as u32);
 
-        return self.bufs[buf_id].acquire_for_read();
+        return (self.bufs[buf_id].acquire_for_read(), buf_id);
     }
 
 

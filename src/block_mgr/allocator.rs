@@ -81,11 +81,11 @@ impl BlockAllocator {
     }
 
     /// Find or allocate a new data block.
-    pub fn get_free(&self) -> Result<BlockLockedMut<DataBlock>, Error> {
-        if let Some(block) = self.find_free_block()? {
+    pub fn get_free(&self, file_id: u16) -> Result<BlockLockedMut<DataBlock>, Error> {
+        if let Some(block) = self.find_free_block(file_id)? {
             Ok(block)
         } else {
-            self.allocate_block()
+            self.allocate_block(file_id)
         }
     }
 
@@ -95,24 +95,22 @@ impl BlockAllocator {
     }
 
     /// In some of datastore files add a new extent, return first free block from that extent.
-    pub fn allocate_block(&self) -> Result<BlockLockedMut<DataBlock>, Error> {
+    pub fn allocate_block(&self, file_id: u16) -> Result<BlockLockedMut<DataBlock>, Error> {
         // in some of data files add a new extent;
         // try to get free block in that extent and return the block;
         // if free block was not found then add extent and repeat attempt.
-        self.block_mgr.get_data_files(&mut self.file_desc_buf.borrow_mut());
-        let file_desc_set = &self.file_desc_buf.borrow();
-        for desc in file_desc_set.iter() {
-            // try adding a new extent to datastore file
-            self.free_info.get_fi_for_file(desc.file_id, &mut self.file_fi_data.borrow_mut())?;
-            if self.file_fi_data.borrow().size() < desc.max_extent_num {
-                self.block_mgr.add_extent(desc.file_id)?;
-                self.free_info.add_extent(desc.file_id)?;
-                let extent_id = self.file_fi_data.borrow().size();
-                if let Some(block) = self.find_free_block_in_extent(desc.file_id, extent_id)? {
-                    return Ok(block);
-                }
+        let desc = self.block_mgr.get_file_desc(file_id).ok_or(Error::file_does_not_exist())?;
+        // try adding a new extent to datastore file
+        self.free_info.get_fi_for_file(desc.file_id, &mut self.file_fi_data.borrow_mut())?;
+        if self.file_fi_data.borrow().size() < desc.max_extent_num {
+            self.block_mgr.add_extent(desc.file_id)?;
+            self.free_info.add_extent(desc.file_id)?;
+            let extent_id = self.file_fi_data.borrow().size();
+            if let Some(block) = self.find_free_block_in_extent(desc.file_id, extent_id)? {
+                return Ok(block);
             }
         }
+        
         return Err(Error::db_size_limit_reached());
     }
 
@@ -197,20 +195,16 @@ impl BlockAllocator {
     }
 
     // find and return block with free space.
-    fn find_free_block(&self) -> Result<Option<BlockLockedMut<DataBlock>>, Error> {
-        // search through free info of each file in datastore;
+    fn find_free_block(&self, file_id: u16) -> Result<Option<BlockLockedMut<DataBlock>>, Error> {
         // find exntents with free blocks;
         // try getting the block.
-        self.block_mgr.get_data_files(&mut self.file_desc_buf.borrow_mut());
-        let file_desc_set = &self.file_desc_buf.borrow();
-        for desc in file_desc_set.iter() {
-            self.free_info.get_fi_for_file(desc.file_id, &mut self.file_fi_data.borrow_mut())?;
-            let file_fi_data = self.file_fi_data.borrow();
-            let mut free_iter = file_fi_data.free_iter();
-            while let Some(extent_id) = free_iter.next() {
-                if let Some(block) = self.find_free_block_in_extent(desc.file_id, extent_id)? {
-                    return Ok(Some(block));
-                }
+        let desc = self.block_mgr.get_file_desc(file_id).ok_or(Error::file_does_not_exist())?;
+        self.free_info.get_fi_for_file(desc.file_id, &mut self.file_fi_data.borrow_mut())?;
+        let file_fi_data = self.file_fi_data.borrow();
+        let mut free_iter = file_fi_data.free_iter();
+        while let Some(extent_id) = free_iter.next() {
+            if let Some(block) = self.find_free_block_in_extent(desc.file_id, extent_id)? {
+                return Ok(Some(block));
             }
         }
         Ok(None)
@@ -327,22 +321,23 @@ mod tests {
 
         let checkpoint_csn = 34544;
 
-        let block_id = BlockId::init(3, 1, 1);
-        let block = ba.get_free().unwrap();
+        let file_id = 3;
+        let block_id = BlockId::init(file_id, 1, 1);
+        let block = ba.get_free(file_id).unwrap();
         assert_eq!(block_id, block.get_id());
         drop(block);
         ba.set_free_info_used(&block_id).expect("Failed to set block bit");
-        let block = ba.get_free().unwrap();
-        assert_eq!(BlockId::init(3, 1, 2), block.get_id());
+        let block = ba.get_free(file_id).unwrap();
+        assert_eq!(BlockId::init(file_id, 1, 2), block.get_id());
         drop(block);
         ba.set_free_info_free(&block_id).expect("Failed to set block bit");
-        let block = ba.get_free().unwrap();
+        let block = ba.get_free(file_id).unwrap();
         assert_eq!(block_id, block.get_id());
         drop(block);
 
 
-        let block_id = BlockId::init(3, 3, 1);
-        let block = ba.allocate_block().expect("Failed to allocate block");
+        let block_id = BlockId::init(file_id, 3, 1);
+        let block = ba.allocate_block(file_id).expect("Failed to allocate block");
         assert_eq!(block_id, block.get_id());
         drop(block);
 

@@ -3,6 +3,7 @@
 use crate::common::errors::Error;
 use crate::common::defs::ObjectId;
 use crate::common::defs::Vector;
+use crate::common::defs::SeekFrom;
 use crate::common::defs::SharedSequences;
 use crate::storage::block_driver::BlockStorageDriver;
 use crate::storage::block_driver::BlockStorageSharedState;
@@ -72,8 +73,8 @@ impl<'b> StorageDriver {
     }
 
     /// Create a new object.
-    pub fn create(&self, tsn: u64, csn: u64, initial_size: usize) -> Result<(ObjectId, Handle), Error> {
-        let (o, c) = self.driver.create(tsn, csn, initial_size)?;
+    pub fn create(&self, file_id: u16, tsn: u64, csn: u64, initial_size: usize) -> Result<(ObjectId, Handle), Error> {
+        let (o, c) = self.driver.create(file_id, tsn, csn, initial_size)?;
         Ok((o, Handle {cursor: c}))
     }
 
@@ -108,9 +109,9 @@ impl<'b> StorageDriver {
         self.driver.write(&mut h.cursor, data)
     }
 
-    /// Seek inside object from current position forward.
-    pub fn seek(&self, h: &mut Handle, pos: u64) -> Result<u64, Error> {
-        self.driver.seek(&mut h.cursor, pos)
+    /// seek to a certain position in an opened object.
+    pub fn seek(&self, h: &mut Handle, from: SeekFrom, pos: u64, obj_id: &ObjectId) -> Result<u64, Error> {
+        self.driver.seek(&mut h.cursor, from, pos, obj_id)
     }
 
     /// Rollback changes made by a transaction.
@@ -138,7 +139,7 @@ impl<'b> StorageDriver {
     }
 
     /// Add a new file to datastore.
-    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
+    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<u16, Error> {
         self.driver.add_datafile(file_type, extent_size, extent_num, max_extent_num)
     }
 

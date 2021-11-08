@@ -363,7 +363,7 @@ impl DataStore {
 
     /// Add a new file to datastore. extent_num is the number of data extents, and excludes extent 0
     /// which is file header.
-    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
+    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<u16, Error> {
 
         if (extent_size as usize) < MIN_EXTENT_SIZE || (extent_size as usize) > MAX_EXTENT_SIZE {
             return Err(Error::incorrect_extent_size());
@@ -408,7 +408,7 @@ impl DataStore {
             return Err(Error::failed_to_build_path());
         }
 
-        Ok(())
+        Ok(file_id)
     }
 
     /// Return number of free info blocks for an extent of a certain size.
@@ -1012,8 +1012,8 @@ mod tests {
             drop(block);
         }
 
-        ds2.add_datafile(FileType::DataStoreFile, 16, 3, 3).expect("Failed to add file");
-        let desc = ds.get_file_desc(6).expect("No file description for file id found");
+        let file_id = ds2.add_datafile(FileType::DataStoreFile, 16, 3, 3).expect("Failed to add a data file");
+        let desc = ds.get_file_desc(file_id).expect("No file description for file id found");
         assert_eq!(FileType::DataStoreFile, desc.file_type);
         assert_eq!(16, desc.extent_size);
         assert_eq!(3, desc.extent_num);

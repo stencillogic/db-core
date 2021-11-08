@@ -5,6 +5,7 @@ use crate::common::errors::ErrorKind;
 use crate::common::defs::ObjectId;
 use crate::common::defs::BlockId;
 use crate::common::defs::Vector;
+use crate::common::defs::SeekFrom;
 use crate::common::defs::SharedSequences;
 use crate::system::config::ConfigMt;
 use crate::storage::datastore::FileType;
@@ -168,8 +169,8 @@ impl<'b> BlockStorageDriver {
     }
 
     /// Create a new object.
-    pub fn create(&self, tsn: u64, csn: u64, initial_size: usize) -> Result<(ObjectId, Cursor), Error> {
-        let (mut block, _) = self.get_free_mut(initial_size)?;
+    pub fn create(&self, file_id: u16, tsn: u64, csn: u64, initial_size: usize) -> Result<(ObjectId, Cursor), Error> {
+        let (mut block, _) = self.get_free_mut(file_id, initial_size)?;
 
         let block_id = block.get_id();
         let entry_sz = std::cmp::min(block.get_free_space() - VERENTRY_HEADER_LEN, initial_size + ENTRY_HEADER_LEN);
@@ -290,7 +291,7 @@ impl<'b> BlockStorageDriver {
             block_id,
             entry_id: obj_id.entry_id,
             entry_pos: 0,
-            appending: false,
+            appending: entry.data_size() == 0,
             tsn,
             csn,
         })
@@ -415,7 +416,7 @@ impl<'b> BlockStorageDriver {
             let cur_entry_id = c.entry_id;
             drop(cur_block);
 
-            let (mut new_block, checkpoint_csn) = self.get_free_mut(data.len())?;
+            let (mut new_block, checkpoint_csn) = self.get_free_mut(c.block_id.file_id, data.len())?;
             let new_block_id = new_block.get_id();
 
             let entry_sz = std::cmp::min(new_block.get_free_space() - VERENTRY_HEADER_LEN, data.len() + ENTRY_HEADER_LEN);
@@ -525,8 +526,30 @@ impl<'b> BlockStorageDriver {
         Ok(buf.len())
     }
 
+    /// seek to a certain position in an opened object.
+    pub fn seek(&self, c: &mut Cursor, from: SeekFrom, pos: u64, obj_id: &ObjectId) -> Result<u64, Error> {
+        match from {
+            SeekFrom::Start => {
+                let block_id = BlockId::from_obj(obj_id);
+                let appending = if c.block_id == block_id && c.entry_id == obj_id.entry_id && c.entry_pos == 0 {
+                    c.appending
+                } else {
+                    false
+                };
+                c.block_id = block_id;
+                c.entry_id = obj_id.entry_id;
+                c.entry_pos = 0;
+                c.appending = appending;
+                self.seek_forward(c, pos)
+            },
+            SeekFrom::Current => {
+                self.seek_forward(c, pos)
+            }
+        }
+    }
+
     /// Seek inside object from current position forward.
-    pub fn seek(&self, c: &mut Cursor, pos: u64) -> Result<u64, Error> {
+    fn seek_forward(&self, c: &mut Cursor, pos: u64) -> Result<u64, Error> {
         let mut remaining = pos;
         let (b, e, v) = self.find_entry_version(c)?;
         let mut block = b;
@@ -617,11 +640,11 @@ impl<'b> BlockStorageDriver {
     ///    extent.
     /// 5. If requested_size is larger than the block size then don't search for free block, rather
     ///    allocate a new one at once.
-    fn get_free_mut(&self, requested_size: usize) -> Result<(BlockLockedMut<DataBlock>, u64), Error> {
+    fn get_free_mut(&self, file_id: u16, requested_size: usize) -> Result<(BlockLockedMut<DataBlock>, u64), Error> {
         let mut block = if requested_size > self.block_mgr.block_fill_size() {
-            self.block_allocator.allocate_block()?
+            self.block_allocator.allocate_block(file_id)?
         } else {
-            self.block_allocator.get_free()?
+            self.block_allocator.get_free(file_id)?
         };
 
         let checkpoint_csn = self.process_checkpoint(&mut block)?;
@@ -700,7 +723,7 @@ impl<'b> BlockStorageDriver {
     }
 
     /// Add a new file to datastore.
-    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
+    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<u16, Error> {
         self.block_mgr.add_datafile(file_type, extent_size, extent_num, max_extent_num)
     }
 
@@ -882,7 +905,7 @@ mod tests {
         let tsn = 123;
         let csn = csns.csn.get_next();
         let initial_size = 100;
-        let (obj, mut cursor) = bd.create(tsn, csn, initial_size).expect("Failed to create object");
+        let (obj, mut cursor) = bd.create(3, tsn, csn, initial_size).expect("Failed to create object");
         let mut total = 3;
         let (_vec, written, _checkpoint_csn) = bd.write(&mut cursor, b"123").expect("Failed to write to a block");
         assert_eq!(written, total);
@@ -896,7 +919,7 @@ mod tests {
         let csn = csns.csn.get_next();
         let mut cursor = bd.begin_write(&obj, tsn, csn).expect("Failed to begin write");
         let pos = 999*20 + 3;
-        let ret_pos = bd.seek(&mut cursor, pos).expect("Failed to seek to position");
+        let ret_pos = bd.seek(&mut cursor, SeekFrom::Current, pos, &obj).expect("Failed to seek to position");
         assert_eq!(ret_pos, pos);
 
         let data2 = b"asdfghjkl;";
@@ -937,7 +960,7 @@ mod tests {
         let data3 = b"-=-=-=++++++";
         write_full_slice(&bd, &mut cursor, data3);
         let seek_pos = 999*20 + 3 - data3.len() as u64;
-        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        let ret_pos = bd.seek(&mut cursor, SeekFrom::Current, seek_pos, &obj).expect("Failed to seek to position");
         assert_eq!(ret_pos, seek_pos);
         write_full_slice(&bd, &mut cursor, data3);
 
@@ -947,7 +970,7 @@ mod tests {
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"123");
         let seek_pos = 999*20;
-        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        let ret_pos = bd.seek(&mut cursor, SeekFrom::Current, seek_pos, &obj).expect("Failed to seek to position");
         assert_eq!(ret_pos, seek_pos);
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"asd");
@@ -956,7 +979,7 @@ mod tests {
         let read_buf = &mut [0;3];
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"-=-");
-        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        let ret_pos = bd.seek(&mut cursor, SeekFrom::Current, seek_pos, &obj).expect("Failed to seek to position");
         assert_eq!(ret_pos, seek_pos);
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"-=-");
@@ -970,7 +993,7 @@ mod tests {
         let read_buf = &mut [0;3];
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"123");
-        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        let ret_pos = bd.seek(&mut cursor, SeekFrom::Current, seek_pos, &obj).expect("Failed to seek to position");
         assert_eq!(ret_pos, seek_pos);
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"asd");
@@ -979,7 +1002,7 @@ mod tests {
         let read_buf = &mut [0;3];
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"123");
-        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        let ret_pos = bd.seek(&mut cursor, SeekFrom::Current, seek_pos, &obj).expect("Failed to seek to position");
         assert_eq!(ret_pos, seek_pos);
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, b"asd");
@@ -994,7 +1017,7 @@ mod tests {
         let data4 = b"123";
         write_full_slice(&bd, &mut cursor, data4);
         let seek_pos = 999*20;
-        let ret_pos = bd.seek(&mut cursor, seek_pos).expect("Failed to seek to position");
+        let ret_pos = bd.seek(&mut cursor, SeekFrom::Current, seek_pos, &obj).expect("Failed to seek to position");
         assert_eq!(ret_pos, seek_pos);
         write_full_slice(&bd, &mut cursor, data4);
 
@@ -1049,7 +1072,7 @@ mod tests {
 
         let mut cursor = bd.begin_read(&obj, tsn, csn).expect("Failed to start reading");
         let read_buf = &mut [0;3];
-        bd.seek(&mut cursor, entry_pos as u64).expect("Failed  to seek");
+        bd.seek(&mut cursor, SeekFrom::Current, entry_pos as u64, &obj).expect("Failed  to seek");
         read_full_slice(&bd, &mut cursor, read_buf);
         assert_eq!(read_buf, data);
 

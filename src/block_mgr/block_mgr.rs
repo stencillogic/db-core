@@ -311,7 +311,7 @@ impl BlockMgr {
     }
 
     /// Add a new file to datastore.
-    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
+    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<u16, Error> {
         self.ds.add_datafile(file_type, extent_size, extent_num, max_extent_num)
     }
 

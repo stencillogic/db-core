@@ -203,3 +203,8 @@ impl Vector {
     } 
 }
 
+pub enum SeekFrom {
+    Start,
+    Current,
+}
+

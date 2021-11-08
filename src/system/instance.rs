@@ -4,6 +4,7 @@
 use crate::common::errors::Error;
 use crate::common::defs::Sequence;
 use crate::common::defs::ObjectId;
+use crate::common::defs::SeekFrom;
 use crate::common::defs::SharedSequences;
 use crate::tran_mgr::tran_mgr::TranMgr;
 use crate::log_mgr::log_mgr::RecType;
@@ -77,8 +78,8 @@ impl Instance {
         DataStore::initialize_datastore(path, block_size, desc_set)
     }
 
-    /// Add a new file to datastore.
-    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<(), Error> {
+    /// Add a new file to datastore and return it's file_id.
+    pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<u16, Error> {
         self.storage_driver.add_datafile(file_type, extent_size, extent_num, max_extent_num)
     }
 
@@ -139,7 +140,7 @@ impl Instance {
     /// returning error.
     pub fn open_write<'a>(&'a self, obj_id: &ObjectId, t: &'a mut Transaction, timeout: i64) -> Result<ObjectWrite, Error> {
 
-        let _guard = self.tran_mgr.lock_object(t.tsn, obj_id);
+        let guard = self.tran_mgr.lock_object(t.tsn, obj_id);
 
         if let Some(txn) = self.storage_driver.is_locked(obj_id)? {
             if txn != t.tsn {
@@ -152,6 +153,8 @@ impl Instance {
         t.last_write_csn = self.csns.csn.get_next();
 
         let handle = self.storage_driver.begin_write(obj_id, t.tsn, t.last_write_csn)?;
+
+        drop(guard);
 
         Ok(ObjectWrite {
             obj: Object {
@@ -167,10 +170,10 @@ impl Instance {
     /// create a new object and open it for write
     /// after object is opened it is possible to read, write and seek object data
     /// operation puts lock on the object which is released after commit or rollback
-    pub fn open_create<'a>(&'a self, t: &'a mut Transaction, initial_size: usize) -> Result<ObjectWrite, Error> {
+    pub fn open_create<'a>(&'a self, file_id: u16, t: &'a mut Transaction, initial_size: usize) -> Result<ObjectWrite, Error> {
 
         t.last_write_csn = self.csns.csn.get_next();
-        let (id, handle) = self.storage_driver.create(t.tsn, t.last_write_csn, initial_size)?;
+        let (id, handle) = self.storage_driver.create(file_id, t.tsn, t.last_write_csn, initial_size)?;
 
         Ok(ObjectWrite {
             obj: Object {
@@ -186,14 +189,22 @@ impl Instance {
     /// Delete object
     pub fn delete(&self, obj_id: &ObjectId, t: &mut Transaction, timeout: i64) -> Result<(), Error> {
 
-        let _guard = self.tran_mgr.lock_object(t.tsn, obj_id);
+        let guard = self.tran_mgr.lock_object(t.tsn, obj_id);
 
         if let Some(txn) = self.storage_driver.is_locked(obj_id)? {
-            self.tran_mgr.wait_for(txn, timeout);
+            if txn != t.tsn {
+                if !self.tran_mgr.wait_for(txn, timeout) {
+                    return Err(Error::timeout());
+                }
+            }
         }
 
         t.last_write_csn = self.csns.csn.get_next();
+
         let checkpoint_csn = self.storage_driver.delete(obj_id, t.tsn, t.last_write_csn)?;
+
+        drop(guard);
+
         self.log_mgr.write_delete(t.last_write_csn, checkpoint_csn, t.tsn, &obj_id)
     }
 
@@ -378,9 +389,9 @@ pub struct Object<'a> {
 
 impl<'a> Object<'a> {
 
-    /// seek to certain position in opened object
-    fn seek(&mut self, pos: u64) -> Result<u64, Error> {
-        let res = self.instance.storage_driver.seek(&mut self.handle, pos)?;
+    /// seek to certain position in an opened object.
+    fn seek(&mut self, from: SeekFrom, pos: u64) -> Result<u64, Error> {
+        let res = self.instance.storage_driver.seek(&mut self.handle, from, pos, &self.id)?;
         self.cur_pos += res;
         Ok(res)
     }
@@ -429,7 +440,7 @@ pub trait Read {
 
     fn get_id(&self) -> ObjectId;
 
-    fn seek(&mut self, pos: u64) -> Result<u64, Error>;
+    fn seek(&mut self, from: SeekFrom, pos: u64) -> Result<u64, Error>;
 
     fn read_next(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
 }
@@ -449,8 +460,8 @@ impl<'a> Write for ObjectWrite<'a> {
 
 impl<'a> Read for ObjectWrite<'a> {
 
-    fn seek(&mut self, pos: u64) -> Result<u64, Error> {
-        self.obj.seek(pos)
+    fn seek(&mut self, from: SeekFrom, pos: u64) -> Result<u64, Error> {
+        self.obj.seek(from, pos)
     }
 
     fn read_next(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
@@ -464,8 +475,8 @@ impl<'a> Read for ObjectWrite<'a> {
 
 impl<'a> Read for Object<'a> {
 
-    fn seek(&mut self, pos: u64) -> Result<u64, Error> {
-        self.seek(pos)
+    fn seek(&mut self, from: SeekFrom, pos: u64) -> Result<u64, Error> {
+        self.seek(from, pos)
     }
 
     fn read_next(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
@@ -553,8 +564,7 @@ mod tests {
         obj.write_next(data).expect("Failed to write data");
     }
 
-    fn read_full(obj: &mut Object, data: &[u8]) {
-        let mut read_buf = vec![0u8;data.len()];
+    fn read_full<T: Read>(obj: &mut T, read_buf: &mut [u8]) {
         let mut read = 0;
         let len = read_buf.len();
         while read < len {
@@ -563,6 +573,11 @@ mod tests {
             read += r;
         }
         assert_eq!(read, len);
+    }
+
+    fn read_and_check<T: Read>(obj: &mut T, data: &[u8]) {
+        let mut read_buf = vec![0u8;data.len()];
+        read_full(obj, &mut read_buf);
         assert_eq!(read_buf, data);
     }
 
@@ -571,6 +586,7 @@ mod tests {
         let dspath = "/tmp/test_instance_098123";
         let log_dir = "/tmp/test_instance_56445";
         let block_size = 8192;
+        let file_id1 = 3;
 
         let _init_fdesc = init_datastore(dspath, block_size);
 
@@ -609,7 +625,7 @@ mod tests {
         // add data file 
 
 
-        instance.add_datafile(FileType::DataStoreFile, 1000, 10, 1000).expect("Failed to add data file");
+        let file_id2 = instance.add_datafile(FileType::DataStoreFile, 1000, 10, 1000).expect("Failed to add data file");
 
 
 
@@ -620,21 +636,21 @@ mod tests {
 
         let mut trn = instance.begin_transaction().expect("Failed to begin transaction");
 
-        let mut ocr = instance.open_create(&mut trn, 200).expect("Failed to create object");
+        let mut ocr = instance.open_create(file_id1, &mut trn, 200).expect("Failed to create object");
         let obj_id = ocr.get_id();
         write_full(&mut ocr, &data);
         drop(ocr);
 
         let mut ord = instance.open_read(&obj_id, &trn).expect("Failed to open for reading");
         assert_eq!(ord.get_id(), obj_id);
-        read_full(&mut ord, &data);
+        read_and_check(&mut ord, &data);
         drop(ord);
 
         let data2 = create_data(block_size);
         let mut owr = instance.open_write(&obj_id, &mut trn, 1000).expect("Failed to open for writing");
         assert_eq!(owr.get_id(), obj_id);
         write_full(&mut owr, &data2);
-        owr.seek((block_size + block_size/2) as u64).expect("Failed to seek");
+        owr.seek(SeekFrom::Current, (block_size + block_size/2) as u64).expect("Failed to seek");
         write_full(&mut owr, &data2);
         drop(owr);
 
@@ -646,7 +662,7 @@ mod tests {
 
         let mut ord = instance.open_read(&obj_id, &trn).expect("Failed to open for reading");
         assert_eq!(ord.get_id(), obj_id);
-        read_full(&mut ord, &new_data);
+        read_and_check(&mut ord, &new_data);
         drop(ord);
 
         instance.delete(&obj_id, &mut trn, 1000).expect("Failed to delete object");
@@ -656,7 +672,7 @@ mod tests {
         let res = instance.open_read(&obj_id, &trn);
         assert!(res.is_err());
 
-        let mut ocr = instance.open_create(&mut trn, 300).expect("Failed to create object");
+        let mut ocr = instance.open_create(file_id2, &mut trn, 300).expect("Failed to create object");
         let obj_id = ocr.get_id();
         write_full(&mut ocr, &data);
         drop(ocr);
@@ -673,14 +689,62 @@ mod tests {
         let trn = instance.begin_transaction().expect("Failed to begin transaction");
 
         let mut ord = instance.open_read(&obj_id, &trn).expect("Failed to open for reading");
-        read_full(&mut ord, &data);
+        read_and_check(&mut ord, &data);
         drop(ord);
 
 
         instance.rollback(trn).expect("Failed to rollback transaction");
 
 
-        // concurrent writes
+        // concurrent writes & reads
+
+
+        // create an object and update it concurrently
+        let mut trn = instance.begin_transaction().expect("Failed to begin transaction");
+        let mut ocr = instance.open_create(file_id1, &mut trn, 4).expect("Failed to create object");
+        let obj_id = ocr.get_id();
+        write_full(&mut ocr, &[0u8,0u8,0u8,0u8]);
+        drop(ocr);
+        instance.commit(trn).expect("Failed to commit transaction");
+
+        let instance_num = 4;
+        let iterations = 100;
+        let mut threads = vec![];
+        for instn in 0..instance_num {
+
+            let ss = instance.get_shared_state().expect("Failed to get shared state");
+
+            let th = std::thread::spawn(move || {
+                let mut data = [0u8;4];
+                let instance2 = Instance::from_shared_state(ss).expect("Failed to create instance");
+                for itrn in 0..iterations {
+                    let mut trn = instance2.begin_transaction().expect("Failed to begin transaction 1");
+                    let mut owr = instance2.open_write(&obj_id, &mut trn, -1).expect("Failed to create object");
+                    read_full(&mut owr, &mut data);
+                    let val = u32::from_ne_bytes(data) + 1;
+                    owr.seek(SeekFrom::Start, 0).expect("Failed to seek");
+                    write_full(&mut owr, &val.to_ne_bytes());
+                    drop(owr);
+                    instance2.commit(trn).expect("Failed to commit transaction");
+                }
+                instance2.terminate();
+            });
+
+            threads.push(th);
+        }
+
+        for th in threads.drain(..) {
+            th.join().unwrap();
+        }
+
+        let mut data = [0u8;4];
+        let mut trn = instance.begin_transaction().expect("Failed to begin transaction");
+        let mut ord = instance.open_read(&obj_id, &mut trn).expect("Failed to open object");
+        read_full(&mut ord, &mut data);
+        assert_eq!(iterations * instance_num, u32::from_ne_bytes(data));
+        instance.commit(trn).expect("Failed to commit transaction");
+
+        instance.terminate();
     }
 
 }
