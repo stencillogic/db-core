@@ -915,11 +915,11 @@ mod tests {
             max_extent_num: 2,
             file_type:      FileType::DataStoreFile,
         };
-        let desc2 = FileDesc {
+        let mut desc2 = FileDesc {
             state:          FileState::InUse,
             file_id:        4,
             extent_size:    10,
-            extent_num:     3,
+            extent_num:     2,
             max_extent_num: 65500,
             file_type:      FileType::VersioningStoreFile,
         };
@@ -937,6 +937,8 @@ mod tests {
         fdset.push(desc3);
 
         DataStore::initialize_datastore(&dspath, block_size, &fdset).expect("Failed to init datastore");
+        desc2.extent_num = 1;
+        fdset[1].extent_num = 1; // versioning store has no extents allocated
 
         let ds = DataStore::new(conf.clone()).expect("Failed to open datastore");
 

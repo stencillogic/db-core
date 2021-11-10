@@ -475,7 +475,7 @@ mod tests {
             extent_size:    150,
             extent_num:     2,
             max_extent_num: 100,
-            file_type:      FileType::VersioningStoreFile,
+            file_type:      FileType::DataStoreFile,
         };
         let desc3 = FileDesc {
             state:          FileState::InUse,
@@ -485,10 +485,19 @@ mod tests {
             max_extent_num: 65500,
             file_type:      FileType::CheckpointStoreFile,
         };
+        let desc4 = FileDesc {
+            state:          FileState::InUse,
+            file_id:        6,
+            extent_size:    10,
+            extent_num:     2,
+            max_extent_num: 65500,
+            file_type:      FileType::VersioningStoreFile,
+        };
 
         fdset.push(desc1);
         fdset.push(desc2);
         fdset.push(desc3);
+        fdset.push(desc4);
 
         DataStore::initialize_datastore(dspath, block_size, &fdset).expect("Failed to init datastore");
         fdset

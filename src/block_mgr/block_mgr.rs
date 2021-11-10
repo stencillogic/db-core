@@ -481,6 +481,7 @@ mod tests {
 
         block_mgr.get_versioning_files(&mut files);
         assert_eq!(1, files.len());
+        files[0].extent_num = 3; // by default all extents are discarded
         assert_eq!(init_fdesc[1], files[0]);
 
         block_mgr.get_data_files(&mut files);
