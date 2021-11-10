@@ -582,6 +582,9 @@ impl DataStore {
             } + 1;
             let fhe_size = fhe_size * block_size;
             ((f.seek(SeekFrom::End(0))? - fhe_size as u64) / extent_size as u64 / block_size as u64) as u16 + 1
+        } else if file_type == FileType::VersioningStoreFile {
+            // for versioning files existing extents are discarded
+            1
         } else {
             u16::slice_to_int(&header[30..32])?
         };
@@ -763,12 +766,14 @@ impl Drop for DataStore {
 }
 
 
+/// State of database file.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum FileState {
     Initializing = 0,
     InUse = 1,
 }
 
+/// Type of a database file.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub enum FileType {
     DataStoreFile = DATA_FILE_MAGIC as isize,

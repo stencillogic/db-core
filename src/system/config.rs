@@ -1,4 +1,4 @@
-/// Configuration
+//! Configuration management.
 
 
 use crate::common::errors::Error;
@@ -11,17 +11,20 @@ use log::warn;
 
 
 #[derive(Clone)]
+/// Global configuration with multithreading support.
 pub struct ConfigMt {
     conf: Arc<Mutex<Config>>,
 }
 
 impl ConfigMt {
+    /// Create a new configuration instance.
     pub fn new() -> ConfigMt {
         ConfigMt {
             conf: Arc::new(Mutex::new(Config::new()))
         }
     }
 
+    /// Lock and return configration for reading or modification.
     pub fn get_conf(&self) -> MutexGuard<Config> {
         self.conf.lock().unwrap()
     }
@@ -29,6 +32,7 @@ impl ConfigMt {
 
 macro_rules! gen_config {
     ( $( $name:ident, $data_type:ty, $default_val:expr, $get_fn:ident, $set_fn:ident, $str_name:literal, $conv_fn:path ), *) => {
+        /// Struct to access configuration values.
         pub struct Config {
             $(
                 $name: $data_type,
@@ -37,6 +41,7 @@ macro_rules! gen_config {
 
         impl Config {
         
+            /// Create a new configuration instance.
             pub fn new() -> Config {
                 Config {
                     $(
@@ -46,10 +51,12 @@ macro_rules! gen_config {
             }
 
             $(
+                /// Get value of a parameter.
                 pub fn $get_fn(&self) -> &$data_type {
                     &self.$name
                 }
 
+                /// Set value of a parameter.
                 pub fn $set_fn(&mut self, $name: $data_type) {
                     self.$name = $name;
                 }
@@ -73,6 +80,7 @@ macro_rules! gen_config {
 
 impl Config {
 
+    /// Load configuration from a file.
     pub fn load(&mut self, file_path: &str) -> Result<(), Error> {
         let f = BufReader::new(OpenOptions::new()
             .create(false)

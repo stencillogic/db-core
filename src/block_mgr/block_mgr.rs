@@ -27,7 +27,12 @@ use crate::block_mgr::block::BlockLockedMut;
 use crate::block_mgr::block::RwLockGuard;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 use std::ops::DerefMut;
+
+
+// if no buffer space available then wait for this amount of time before the next try 
+const WAIT_WRITER_THREADS_MS: u64 = 100;
 
 
 pub struct BlockMgr {
@@ -136,12 +141,10 @@ impl BlockMgr {
         if let Some((data, buf_idx)) = self.buf_mgr.get_block(&block_id) {
             Ok(BlockLocked::new(lock_holder, init_fun(*block_id, buf_idx, data)))
         } else {
-            drop(lock_holder);
 
             let block_type = self.determine_block_type(&block_id);
             let ds_data = self.ds.load_block(&block_id, FileState::InUse)?;
 
-            let lock_holder = RwLockGuard::Read(self.locks[lid].read().unwrap());
             let (mut data, buf_idx) = self.allocate_on_cache(*block_id, block_type);
             data.copy_from_slice(&ds_data);
             return Ok(BlockLocked::new(lock_holder, init_fun(*block_id, buf_idx, data)))
@@ -169,16 +172,10 @@ impl BlockMgr {
             self.set_dirty(buf_idx, true);
             Ok(BlockLockedMut::new(BlockLocked::new(lock_holder, init_fun(*block_id, buf_idx, data))))
         } else {
-            drop(lock_holder);
 
             let block_type = self.determine_block_type(&block_id);
             let ds_data = self.ds.load_block(&block_id, FileState::InUse)?;
 
-            let lock_holder = if try_lock {
-                RwLockGuard::Write(self.locks[lid].try_write().map_err(|_| Error::try_lock_error())?)
-            } else {
-                RwLockGuard::Write(self.locks[lid].write().unwrap())
-            };
             let (mut data, buf_idx) = self.allocate_on_cache(*block_id, block_type);
             data.copy_from_slice(&ds_data);
 
@@ -243,8 +240,8 @@ impl BlockMgr {
             if let Some((data, buf_idx)) = self.buf_mgr.allocate_on_cache(&block_id, block_type) {
                 return (data, buf_idx)
             } else {
-                // trigger buffer writer and wait for completion
-                panic!("No free space in the buffer");
+                // wait for some time 
+                std::thread::sleep(Duration::from_millis(WAIT_WRITER_THREADS_MS));
             }
         }
     }
@@ -313,11 +310,6 @@ impl BlockMgr {
     /// Add a new file to datastore.
     pub fn add_datafile(&self, file_type: FileType, extent_size: u16, extent_num: u16, max_extent_num: u16) -> Result<u16, Error> {
         self.ds.add_datafile(file_type, extent_size, extent_num, max_extent_num)
-    }
-
-    /// Return number of free info blocks for an extent of a certain size.
-    pub fn calc_extent_fi_block_num(&self, extent_size: usize) -> usize {
-        self.ds.calc_extent_fi_block_num(extent_size)
     }
 }
 

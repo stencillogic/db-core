@@ -200,9 +200,7 @@ mod tests {
         ret
     }
 
-    fn flush_blocks(bw: &BufWriter, block_mgr: &BlockMgr, idxs: &[usize]) {
-
-        bw.wake_writers();
+    fn flush_blocks(block_mgr: &BlockMgr, idxs: &[usize]) {
 
         let mut i =0;
         assert!(loop {
@@ -257,13 +255,13 @@ mod tests {
         for i in 0..add_cnt {
             idxs.push(add_block(3, 1, 1 + i, &cs, &block_mgr, checkpoint_csn));
         }
-        flush_blocks(&buf_writer, &block_mgr, &idxs);
+        flush_blocks(&block_mgr, &idxs);
 
         check_added_num(add_cnt as usize, &cs, checkpoint_csn);
 
         idxs.truncate(0);
         idxs.push(add_block(3, 1, 1 + add_cnt, &cs, &block_mgr, checkpoint_csn));
-        flush_blocks(&buf_writer, &block_mgr, &idxs);
+        flush_blocks(&block_mgr, &idxs);
 
         // emulate restart, otherwise buf can contain unsynced block data previously read from checkpint store.
         drop(cs);
@@ -290,8 +288,9 @@ mod tests {
             idxs.push(add_block(3, 2, 1 + i, &cs, &block_mgr, checkpoint_csn));
         }
 
-        flush_blocks(&buf_writer, &block_mgr, &idxs);
+        flush_blocks(&block_mgr, &idxs);
 
         check_added_num(add_cnt as usize * 2, &cs, checkpoint_csn);
+        buf_writer.terminate();
     }
 }

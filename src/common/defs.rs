@@ -1,4 +1,4 @@
-/// Different reusable definitions
+//! Common definitions.
 
 
 use std::io::Write;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::common::misc::SliceToIntConverter;
 
 
-/// object identifier
+/// Object identifier.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub struct ObjectId
 {
@@ -50,7 +50,7 @@ impl ObjectId {
     }
 }
 
-/// block identifier
+/// Block identifier.
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Debug)]
 pub struct BlockId
 {
@@ -93,7 +93,7 @@ impl BlockId {
     }
 }
 
-/// Numberic sequence
+/// Numeric sequence that can be shared by several threads.
 #[derive(Clone)]
 pub struct Sequence {
     sn: Arc<AtomicU64>,
@@ -140,7 +140,7 @@ pub struct SharedSequences {
 pub const VECTOR_DATA_LENGTH: usize = 10;
 
 
-/// Vector (data pointer) 
+/// Vector (data pointer). 
 #[derive(Clone, Copy, Debug)]
 pub struct Vector {
     obj:        ObjectId,
@@ -203,6 +203,7 @@ impl Vector {
     } 
 }
 
+/// Seek postition.
 pub enum SeekFrom {
     Start,
     Current,

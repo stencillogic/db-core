@@ -22,13 +22,16 @@ use log::error;
 
 
 const CONDVAR_WAIT_INTERVAL_MS: u64 = 1000;
+const WAKE_WRITER_THREADS_INTERVAL_MS: u64 = 1000;
 
 
 #[derive(Clone)]
 pub struct BufWriter {
-    writer_threads:     Arc<(Vec<JoinHandle<()>>, Arc<AtomicBool>)>,
+    writer_threads:     Arc<Vec<JoinHandle<()>>>, 
+    terminate:          Arc<AtomicBool>, 
     write_ready:        SyncNotification<usize>,
     chkpnt_allocators:  CheckpointStoreBlockAllocators,
+    waker:              Arc<JoinHandle<()>>
 }
 
 
@@ -56,20 +59,52 @@ impl BufWriter {
             writer_threads.push(handle);
         }
 
+        let writer_threads = Arc::new(writer_threads);
+        let wr = write_ready.clone();
+        let wt = writer_threads.clone();
+        let tm = terminate.clone();
+        let waker = Arc::new(std::thread::spawn(move || {
+            Self::waker_thread(wr, wt, tm);
+        }));
+
         Ok(BufWriter {
-            writer_threads: Arc::new((writer_threads, terminate)),
+            writer_threads,
+            terminate,
             write_ready,
             chkpnt_allocators,
+            waker,
         })
     }
 
-    pub fn wake_writers(&self) {
-        self.write_ready.send(self.writer_threads.0.len(), true);
+    // wake writers with time interval
+    fn waker_thread(write_ready: SyncNotification<usize>, 
+        writer_threads: Arc<Vec<JoinHandle<()>>>,
+        terminate: Arc<AtomicBool>) {
+        while !terminate.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(WAKE_WRITER_THREADS_INTERVAL_MS));
+            write_ready.send(writer_threads.len(), true);
+            loop {
+                if let Some(lock) = write_ready.wait_for_interruptable(
+                    &mut (|count| -> bool { *count != 0 }),
+                    &mut (|| -> bool { terminate.load(Ordering::Relaxed) }),
+                    Duration::from_millis(CONDVAR_WAIT_INTERVAL_MS)
+                ) {
+                    if *lock == 0 {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn terminate(self) {
-        if let Ok((mut writer_threads, terminate)) = Arc::try_unwrap(self.writer_threads) {
-            terminate.store(true, Ordering::Relaxed);
+        if let Ok(waker) = Arc::try_unwrap(self.waker) {
+            self.terminate.store(true, Ordering::Relaxed);
+            waker.join().unwrap();
+
+            let mut writer_threads = Arc::try_unwrap(self.writer_threads).unwrap();
             for jh in writer_threads.drain(..) {
                 jh.join().unwrap();
             }
@@ -94,7 +129,6 @@ impl BufWriter {
                 if *lock > 0 {
                     *lock -= 1;
                     drop(lock);
-
                     if let Err(e) = Self::write_blocks(&block_mgr, &mut chkpnt_allocators) {
                         error!("Failed to perform block write: {}", e);
                     }
@@ -388,8 +422,7 @@ mod tests {
             drop(block);
         }
 
-
-        bw.wake_writers();
+        std::thread::sleep(Duration::from_millis(2*WAKE_WRITER_THREADS_INTERVAL_MS));
 
         let mut i =0;
         assert!(loop {

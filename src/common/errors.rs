@@ -1,11 +1,10 @@
-//!
 //! Error codes and related functions
 //!
 
 
 use std;
 
-
+/// Error representation.
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
@@ -35,6 +34,7 @@ impl std::error::Error for Error { }
 macro_rules! gen_error_kinds {
     ( $($kind:ident, $msg:literal), *) => {
         #[derive(Debug, PartialEq, Copy, Clone)]
+        /// Types of errors.
         pub enum ErrorKind {
             $(
                 $kind,
@@ -42,6 +42,7 @@ macro_rules! gen_error_kinds {
         }
 
         impl Error {
+            /// Returns string description of a error.
             pub fn str_desc(&self) -> &str {
                 match self.kind {
                     $(
@@ -58,6 +59,7 @@ macro_rules! gen_create_fun {
     ( $($kind:ident, $create_fun:ident), *) => {
         impl Error {
             $(
+                /// Create an error of a given type.
                 #[inline]
                 pub fn $create_fun() -> Self {
                     Self::new(ErrorKind::$kind, ErrorRepr::Simple)
@@ -69,6 +71,7 @@ macro_rules! gen_create_fun {
     ( $($kind:ident, $create_fun:ident, $fun_arg:path), *) => {
         impl Error {
             $(
+                /// Create an error of a given type.
                 #[inline]
                 pub fn $create_fun(e: $fun_arg) -> Self {
                     Self::new(ErrorKind::$kind, ErrorRepr::$kind(e))

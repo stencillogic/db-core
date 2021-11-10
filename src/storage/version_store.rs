@@ -28,7 +28,6 @@ use crate::block_mgr::block::DataBlock;
 use crate::block_mgr::block::BasicBlock;
 use crate::block_mgr::block::BlockLockedMut;
 use crate::block_mgr::allocator::BlockAllocator;
-use crate::storage::datastore::FileDesc;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -199,8 +198,7 @@ struct VersioningStoreEntryAllocator {
 impl VersioningStoreEntryAllocator {
 
     pub fn new(block_mgr: Rc<BlockMgr>, block_allocator: Rc<BlockAllocator>) -> Result<VersioningStoreEntryAllocator, Error> {
-        let mut file_desc_buf = RefCell::new(vec![]);
-        let (file_id, extent_id, extent_size) = Self::get_versioning_extent(&block_mgr, &mut file_desc_buf)?;
+        let (file_id, extent_id, extent_size) = block_allocator.allocate_versioning_extent()?;
         let block_id = BlockId::init(file_id, extent_id, 1);
 
         let used_space          = Arc::new(AtomicUsize::new(2 + DBLOCK_HEADER_LEN));
@@ -308,15 +306,6 @@ impl VersioningStoreEntryAllocator {
         lock.block_id = block_id;
 
         Ok(block_id)
-    }
-
-    fn get_versioning_extent(block_mgr: &BlockMgr, file_desc_buf: &mut RefCell<Vec<FileDesc>>) -> Result<(u16, u16, u16), Error> {
-        block_mgr.get_versioning_files(&mut file_desc_buf.borrow_mut());
-        let file_desc_set = &file_desc_buf.borrow();
-        for desc in file_desc_set.iter() {
-            return Ok((desc.file_id, 1, desc.extent_size));
-        }
-        return Err(Error::db_size_limit_reached())
     }
 }
 

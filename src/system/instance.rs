@@ -1,4 +1,5 @@
-/// Interface to the instance.
+//! Interface to the DBMS.
+//!
 
 
 use crate::common::errors::Error;
@@ -35,9 +36,9 @@ pub struct Instance {
     checkpointer:       Arc<Checkpointer>,
 }
 
-/// System instance
 impl Instance {
 
+    /// Create a new instance with given configuration.
     pub fn new(conf: ConfigMt) -> Result<Instance, Error> {
 
         let tran_mgr =          TranMgr::new(conf.clone())?;
@@ -83,8 +84,7 @@ impl Instance {
         self.storage_driver.add_datafile(file_type, extent_size, extent_num, max_extent_num)
     }
 
-    /// begin a new transaction
-    /// return tns of newely started transaction on success
+    /// Begin a new transaction.
     pub fn begin_transaction(&self) -> Result<Transaction, Error> {
         let csn = self.csns.csn.get_cur();
         let tsn = self.tran_mgr.start_tran();
@@ -98,7 +98,7 @@ impl Instance {
         })
     }
 
-    /// commit transaction
+    /// Commit transaction.
     pub fn commit(&self, t: Transaction) -> Result<(), Error> {
         if t.last_write_csn > t.start_csn {
             let commit_csn = self.csns.csn.get_next();
@@ -110,7 +110,7 @@ impl Instance {
         Ok(())
     }
 
-    /// rollback transaction
+    /// Rollback transaction.
     pub fn rollback(&self, t: Transaction) -> Result<(), Error> {
         if t.last_write_csn > t.start_csn {
             self.log_mgr.write_rollback(t.last_write_csn, t.tsn)?;
@@ -121,8 +121,8 @@ impl Instance {
         Ok(())
     }
 
-    /// open an existing object for read
-    /// after object is opened it is possible to read and seek through object data
+    /// Open an existing object for read.
+    /// After object is opened it is possible to read and seek through object's data.
     pub fn open_read(&self, obj_id: &ObjectId, t: &Transaction) -> Result<Object, Error> {
         let handle = self.storage_driver.begin_read(obj_id, t.tsn, t.read_committed_csn)?;
         Ok(Object {
@@ -133,11 +133,11 @@ impl Instance {
         })
     }
 
-    /// open an existing object for modification by its id
-    /// after object is opened it is possible to read, write and seek through object data
-    /// operation puts lock on the object which is released after commit or rollback.
-    /// if timeout is -1 then wait indefinitely, otherwise wait for requested time in ms before
-    /// returning error.
+    /// Open an existing object for modification by its id.
+    /// After object is opened it is possible to read, write and seek through object data.
+    /// This operation puts lock on the object which is released after transaction commit or rollback.
+    /// If timeout is -1 then wait indefinitely, otherwise wait for requested time in ms before
+    /// returning error, or until transaction holding lock on the object has finished.
     pub fn open_write<'a>(&'a self, obj_id: &ObjectId, t: &'a mut Transaction, timeout: i64) -> Result<ObjectWrite, Error> {
 
         let guard = self.tran_mgr.lock_object(t.tsn, obj_id);
@@ -167,9 +167,9 @@ impl Instance {
         })
     }
 
-    /// create a new object and open it for write
-    /// after object is opened it is possible to read, write and seek object data
-    /// operation puts lock on the object which is released after commit or rollback
+    /// Create a new object and open it for write.
+    /// After object is opened it is possible to read, write and seek object data.
+    /// This operation puts lock on the object which is released after transaction commit or rollback.
     pub fn open_create<'a>(&'a self, file_id: u16, t: &'a mut Transaction, initial_size: usize) -> Result<ObjectWrite, Error> {
 
         t.last_write_csn = self.csns.csn.get_next();
@@ -186,7 +186,8 @@ impl Instance {
         })
     }
 
-    /// Delete object
+    /// Delete an object. If object is in use, timeout can be specified, and current transaction
+    /// will wait given time until transaction holding the lock on the object has finished.
     pub fn delete(&self, obj_id: &ObjectId, t: &mut Transaction, timeout: i64) -> Result<(), Error> {
 
         let guard = self.tran_mgr.lock_object(t.tsn, obj_id);
@@ -374,11 +375,18 @@ pub struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
 
+    /// Update transaction's change seqence number to the latest commit in the system.
+    /// By default csn of a transaction is set just once when the transaction is created. And any
+    /// changes committed by other transactions after that csn are not visible to the current transaction. 
+    /// This allows current transaction to have a consistent view of data as of certain point in time. 
+    /// This function updates csn to the latest commit, making the latest changes in the system visible 
+    /// to the current transaction.
     pub fn update_read_csn(&mut self) {
         self.read_committed_csn = self.instance.csns.latest_commit_csn.load(Ordering::Relaxed);
     }
 }
 
+/// Object for reading operations.
 pub struct Object<'a> {
     id:         ObjectId,
     instance:   &'a Instance,
@@ -410,6 +418,7 @@ impl<'a> Object<'a> {
 }
 
 
+/// Object for reading and writing.
 pub struct ObjectWrite<'a> {
     obj: Object<'a>,
     txn: &'a Transaction<'a>,
@@ -435,18 +444,23 @@ impl<'a> ObjectWrite<'a> {
     }
 }
 
-
+/// Reading operations.
 pub trait Read {
 
+    /// Returns object id.
     fn get_id(&self) -> ObjectId;
 
+    /// Seek to a certain position starting from the beginnging or from the current position.
     fn seek(&mut self, from: SeekFrom, pos: u64) -> Result<u64, Error>;
 
+    /// Read next portion of data.
     fn read_next(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
 }
 
+/// Writing operations.
 pub trait Write {
 
+    /// Write next portion of data.
     fn write_next(&mut self, data: &[u8]) -> Result<(), Error>;
 }
 
@@ -581,6 +595,7 @@ mod tests {
         assert_eq!(read_buf, data);
     }
 
+
     #[test]
     fn test_instance() {
         let dspath = "/tmp/test_instance_098123";
@@ -589,6 +604,7 @@ mod tests {
         let file_id1 = 3;
 
         let _init_fdesc = init_datastore(dspath, block_size);
+
 
         if Path::new(log_dir).exists() {
             std::fs::remove_dir_all(log_dir).expect("Failed to delete test dir on cleanup");
@@ -628,9 +644,7 @@ mod tests {
         let file_id2 = instance.add_datafile(FileType::DataStoreFile, 1000, 10, 1000).expect("Failed to add data file");
 
 
-
         // read, write & delete
-
 
         let data = create_data(block_size * 3);
 
@@ -710,14 +724,14 @@ mod tests {
         let instance_num = 4;
         let iterations = 100;
         let mut threads = vec![];
-        for instn in 0..instance_num {
+        for _instn in 0..instance_num {
 
             let ss = instance.get_shared_state().expect("Failed to get shared state");
 
             let th = std::thread::spawn(move || {
                 let mut data = [0u8;4];
                 let instance2 = Instance::from_shared_state(ss).expect("Failed to create instance");
-                for itrn in 0..iterations {
+                for _itrn in 0..iterations {
                     let mut trn = instance2.begin_transaction().expect("Failed to begin transaction 1");
                     let mut owr = instance2.open_write(&obj_id, &mut trn, -1).expect("Failed to create object");
                     read_full(&mut owr, &mut data);
