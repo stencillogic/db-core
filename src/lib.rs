@@ -18,7 +18,7 @@
 //! // 
 //!
 //!
-//! // block size for the database.
+//! // Block size for the database.
 //! let block_size = 8192;
 //!
 //!
@@ -131,7 +131,6 @@
 //! instance.rollback(trn).expect("Failed to rollback");
 //!
 //! // Spawn another instance in a different thread.
-//!
 //! let ss = instance.get_shared_state().expect("Failed to get shared state");
 //!
 //! let th = std::thread::spawn(move || {

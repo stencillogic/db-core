@@ -364,7 +364,7 @@ impl Instance {
 
 }
 
-/// Transaction
+/// Transaction.
 pub struct Transaction<'a> {
     instance: &'a Instance,
     tsn: u64,

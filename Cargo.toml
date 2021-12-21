@@ -1,6 +1,6 @@
 [package]
 name = "db-core"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["stencillogic"]
 edition = "2018"
 description = "dbms engine"
