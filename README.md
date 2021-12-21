@@ -170,5 +170,5 @@ See [issues](https://github.com/stencillogic/db-core/issues) for details.
 
 ### Contribution
 
-Contributions are welcome! Please see [Contributing.md](https://github.com/stencillogic/db-core/CONTRIBUTING.md) for details.
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/stencillogic/db-core/blob/master/CONTRIBUTING.md) for details.
 
